@@ -1,0 +1,19 @@
+# Core data processing
+pandas>=2.0
+pyarrow>=12.0
+
+# HTTP download utilities
+requests>=2.31
+
+# Plotting for QC artifacts
+matplotlib>=3.7
+
+# OpenSky flight API client (module: opensky_api)
+# PyPI availability can vary by mirror; pinning to upstream repo keeps installs reproducible.
+opensky-api @ git+https://github.com/openskynetwork/opensky-api.git
+
+# Optional bulk AVRO conversion support
+fastavro>=1.9
+
+# Notebook execution environment
+jupyter>=1.0
