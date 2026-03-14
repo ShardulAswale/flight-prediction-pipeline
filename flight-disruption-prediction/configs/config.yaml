@@ -1,0 +1,25 @@
+opensky:
+  endpoint: "https://opensky-network.org/api/states/all"
+  polling_interval_seconds: 30
+  collection_hours: 1
+  clientId: "ly4427631@gmail.com-api-client"
+  clientSecret: "dLSHHXXDEqtZYHo7KbFNXxkf95monUpd"
+  # Geographic filtering (optional but highly recommended for research)
+  bbox:
+    lamin: 45.0
+    lomin: -5.0
+    lamax: 55.0
+    lomax: 10.0
+
+trajectory:
+  max_gap_minutes: 15
+
+paths:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  states_file_pattern: "states_{date}.parquet"
+  trajectories_file: "trajectories.parquet"
+  features_file: "trajectory_features.parquet"
+  ml_dataset_file: "ml_dataset.parquet"
+
+seed: 42
