@@ -153,4 +153,7 @@ cython_debug/
 data/
 data/raw/
 data/processed/
+flight-disruption-prediction/data/
+flight-disruption-prediction/data/raw/
+flight-disruption-prediction/data/processed/
 *.pyc
