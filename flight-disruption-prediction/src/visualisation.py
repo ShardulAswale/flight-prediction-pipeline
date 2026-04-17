@@ -6,6 +6,13 @@ from typing import List, Optional
 
 class TrajectoryVisualiser:
     """Visualiser for ADS-B Flight Trajectories."""
+
+    @staticmethod
+    def _valid_coordinate_frame(df: pd.DataFrame) -> pd.DataFrame:
+        """Keep only rows with usable latitude/longitude pairs for plotting."""
+        if df.empty:
+            return df
+        return df.dropna(subset=['latitude', 'longitude']).copy()
     
     @staticmethod
     def plot_single_trajectory(df: pd.DataFrame, trajectory_id: str, ax=None):
@@ -15,7 +22,10 @@ class TrajectoryVisualiser:
             print(f"Trajectory {trajectory_id} not found.")
             return
             
-        traj = traj.sort_values('timestamp')
+        traj = TrajectoryVisualiser._valid_coordinate_frame(traj).sort_values('timestamp')
+        if traj.empty:
+            print(f"Trajectory {trajectory_id} has no valid latitude/longitude points.")
+            return
         
         if ax is None:
             fig, ax = plt.subplots(figsize=(10, 8))
@@ -47,11 +57,24 @@ class TrajectoryVisualiser:
         Generate an interactive Folium map for given trajectories.
         If trajectory_ids is None, plots a sample of trajectories up to 10.
         """
+        return TrajectoryVisualiser.generate_interactive_map_with_projections(df, trajectory_ids=trajectory_ids, gap_threshold_seconds=None)
+
+    @staticmethod
+    def generate_interactive_map_with_projections(
+        df: pd.DataFrame,
+        trajectory_ids: Optional[List[str]] = None,
+        gap_threshold_seconds: Optional[float] = None,
+    ) -> folium.Map:
+        """
+        Generate an interactive Folium map and optionally render long time gaps
+        as dashed projected segments instead of solid observed segments.
+        """
         if trajectory_ids is None:
             trajectory_ids = df['trajectory_id'].unique()[:10]
             
         # Determine center of the map
         sample_df = df[df['trajectory_id'].isin(trajectory_ids)]
+        sample_df = TrajectoryVisualiser._valid_coordinate_frame(sample_df)
         if sample_df.empty:
             return folium.Map()
             
@@ -65,20 +88,47 @@ class TrajectoryVisualiser:
         colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige', 'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 'white', 'pink', 'lightblue', 'lightgreen', 'gray', 'black', 'lightgray']
         
         for i, traj_id in enumerate(trajectory_ids):
-            traj = df[df['trajectory_id'] == traj_id].sort_values('timestamp')
+            traj = df[df['trajectory_id'] == traj_id]
+            traj = TrajectoryVisualiser._valid_coordinate_frame(traj).sort_values('timestamp')
             if traj.empty:
                 continue
                 
             coords = list(zip(traj['latitude'], traj['longitude']))
+            if len(coords) < 2:
+                continue
             color = colors[i % len(colors)]
-            
-            folium.PolyLine(
-                coords,
-                weight=3,
-                color=color,
-                opacity=0.8,
-                tooltip=f"Trajectory: {traj_id} (Points: {len(coords)})"
-            ).add_to(m)
+
+            if gap_threshold_seconds is None or 'timestamp' not in traj.columns:
+                folium.PolyLine(
+                    coords,
+                    weight=3,
+                    color=color,
+                    opacity=0.8,
+                    tooltip=f"Trajectory: {traj_id} (Points: {len(coords)})"
+                ).add_to(m)
+            else:
+                for idx in range(1, len(traj)):
+                    prev_row = traj.iloc[idx - 1]
+                    curr_row = traj.iloc[idx]
+                    segment_coords = [
+                        (prev_row['latitude'], prev_row['longitude']),
+                        (curr_row['latitude'], curr_row['longitude']),
+                    ]
+                    gap_seconds = pd.to_numeric(curr_row.get('timestamp'), errors='coerce') - pd.to_numeric(prev_row.get('timestamp'), errors='coerce')
+                    projected = pd.notna(gap_seconds) and float(gap_seconds) > float(gap_threshold_seconds)
+                    tooltip = (
+                        f"Trajectory: {traj_id} | projected gap: {float(gap_seconds) / 60.0:.1f} min"
+                        if projected and pd.notna(gap_seconds)
+                        else f"Trajectory: {traj_id} | observed segment"
+                    )
+                    folium.PolyLine(
+                        segment_coords,
+                        weight=3,
+                        color=color,
+                        opacity=0.85 if not projected else 0.6,
+                        dash_array='6, 10' if projected else None,
+                        tooltip=tooltip,
+                    ).add_to(m)
             
             # Start and end markers
             if len(coords) > 0:

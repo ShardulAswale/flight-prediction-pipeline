@@ -2,9 +2,8 @@ opensky:
   endpoint: "https://opensky-network.org/api/states/all"
   polling_interval_seconds: 30
   collection_hours: 1
-  clientId: "ly4427631@gmail.com-api-client"
-  clientSecret: "dLSHHXXDEqtZYHo7KbFNXxkf95monUpd"
-  # Geographic filtering (optional but highly recommended for research)
+  clientId: ${OPENSKY_CLIENT_ID}
+  clientSecret: ${OPENSKY_CLIENT_SECRET}
   bbox:
     lamin: 45.0
     lomin: -5.0
@@ -14,12 +13,37 @@ opensky:
 trajectory:
   max_gap_minutes: 15
 
+ingestion:
+  year: 2022
+  start_month: 5
+  end_month: 5
+  adsb_combined_file: "data/processed/adsb_combined.parquet"
+  bts_csv_dir: "data/raw/bts"
+  bts_combined_file: "data/processed/bts_combined.parquet"
+  euro_combined_file: "data/processed/eurocontrol_combined.parquet"
+
+# T10: Per-region merge tolerance
+merge:
+  tolerance_hours:
+    EU: 2
+    US: 3
+    default: 2
+
 paths:
+  data_dir: "data"
   raw_data_dir: "data/raw"
   processed_data_dir: "data/processed"
   states_file_pattern: "states_{date}.parquet"
+  opensky_data_file: "adsb_states.parquet"
   trajectories_file: "trajectories.parquet"
   features_file: "trajectory_features.parquet"
   ml_dataset_file: "ml_dataset.parquet"
+  metar_data_file: "data/raw/metar.parquet"  # IATA-coded METAR observations
+
+# T4: Validation mode
+validation_mode: warn_only
+
+training:
+  use_gpu: false
 
 seed: 42

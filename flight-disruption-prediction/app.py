@@ -1,53 +1,85 @@
+"""
+FE1: Multi-page Streamlit Application — Main Entry Point
+"""
 import streamlit as st
 import pandas as pd
-import yaml
-import folium
-from streamlit_folium import st_folium
 import os
 import sys
 
-# Change working directory so we can load src modules
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
-from src.visualisation import TrajectoryVisualiser
-from src.utils import load_config
 
-# Set page wide
-st.set_page_config(layout="wide", page_title="Flight Trajectory Explorer")
-st.title("Interactive Flight Trajectory Explorer")
+st.set_page_config(
+    page_title="Flight Disruption Prediction",
+    page_icon="✈️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-@st.cache_data
-def load_data():
+# Dark theme CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem; font-weight: 700;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header { font-size: 1.1rem; color: #a0aec0; margin-bottom: 2rem; }
+    .metric-card {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        border-radius: 12px; padding: 1.5rem; border: 1px solid #2d3748;
+    }
+    .stMetric > div { background: #1a1a2e; border-radius: 10px; padding: 10px; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="main-header">✈️ Flight Disruption Prediction</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">End-to-end ML pipeline for predicting flight delays and cancellations</div>', unsafe_allow_html=True)
+
+# Dashboard overview
+col1, col2, col3, col4 = st.columns(4)
+
+# Try to load stats
+try:
+    from src.utils import load_config
     config = load_config('configs/config.yaml')
-    traj_path = f"{config['paths']['processed_data_dir']}/{config['paths']['trajectories_file']}"
-    if os.path.exists(traj_path):
-        df_traj = pd.read_parquet(traj_path)
-        return df_traj, config
-    return pd.DataFrame(), config
+    data_dir = config['paths']['processed_data_dir']
+    
+    ml_path = os.path.join(data_dir, config['paths']['ml_dataset_file'])
+    if os.path.exists(ml_path):
+        df = pd.read_parquet(ml_path)
+        col1.metric("Total Flights", f"{len(df):,}")
+        if 'label' in df.columns:
+            col2.metric("Disrupted", f"{(df['label'] != 'Normal').sum():,}")
+        if 'region' in df.columns:
+            col3.metric("Regions", df['region'].nunique())
+        if 'source_dataset' in df.columns:
+            col4.metric("Data Sources", df['source_dataset'].nunique())
+    else:
+        col1.metric("Status", "No Data")
+        col2.info("Run pipeline first")
+except Exception as e:
+    st.info("Run the pipeline to see dashboard metrics.")
 
-df_traj, config = load_data()
+st.divider()
 
-if df_traj.empty:
-    st.warning("No trajectory data found. Please ensure the pipeline has generated processed data.")
-else:
-    trajectory_ids = sorted(df_traj['trajectory_id'].unique())
-    st.sidebar.header("Trajectory Selection")
-    selected_traj = st.sidebar.selectbox("Select a Trajectory:", trajectory_ids)
-    
-    st.subheader(f"Trajectory: {selected_traj}")
-    
-    # Generate Map
-    m = TrajectoryVisualiser.generate_interactive_map(df_traj, trajectory_ids=[selected_traj])
-    
-    # Display Stats
-    traj_data = df_traj[df_traj['trajectory_id'] == selected_traj]
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Data Points", len(traj_data))
-    
-    start_time = pd.to_datetime(traj_data['timestamp'].min(), unit='s').strftime('%Y-%m-%d %H:%M:%S')
-    end_time = pd.to_datetime(traj_data['timestamp'].max(), unit='s').strftime('%Y-%m-%d %H:%M:%S')
-    
-    col2.metric("Start Time", start_time)
-    col3.metric("End Time", end_time)
-    
-    # Display map in Streamlit
-    st_folium(m, width=1200, height=600)
+st.markdown("## 📋 Quick Navigation")
+
+pages = {
+    "📊 Pipeline Overview": "View pipeline stage status, row counts, and merge funnel",
+    "🔍 Data Explorer": "Browse and filter the ML dataset interactively",
+    "🗺️ Trajectory Map": "Visualise flight trajectories on an interactive map",
+    "📈 Feature Analysis": "Correlation matrices, importance rankings, SHAP summaries",
+    "🤖 Model Performance": "Compare trained models, confusion matrices, ROC curves",
+    "🔮 Predictions Explorer": "Interactive prediction tool with SHAP explanations",
+    "🛡️ Data Quality": "Quality gates, missingness, drift alerts",
+}
+
+cols = st.columns(3)
+for i, (page, desc) in enumerate(pages.items()):
+    with cols[i % 3]:
+        st.markdown(f"### {page}")
+        st.markdown(f"_{desc}_")
+
+st.divider()
+st.caption("Built for Flight Disruption Prediction Research • Navigate using the sidebar →")

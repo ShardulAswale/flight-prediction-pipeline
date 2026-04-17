@@ -1,0 +1,308 @@
+# Flight Pipeline — Full Engineering Backlog Implementation Plan
+
+> 40+ tasks across 12 milestones. This plan covers every task, what already exists, and what must be built.
+
+## Gap Analysis Summary
+
+| Milestone | Tasks | Already Done | Remaining | Key Gaps |
+|-----------|-------|-------------|-----------|----------|
+| M0: Data Acquisition | T0A–T0D | Partial (OpenSky client exists, no backfill CLI) | T0A, T0B, T0C, T0D | No date-range backfill, no METAR script |
+| M1: Security | T1–T2 | Partial (.gitignore has credentials.json but null-byte corruption; main.py missing imports) | T1, T2 | `.gitignore` has `\x00` on last lines; `main.py` calls `validate_environment`/`set_seed` without imports |
+| M2: Data Contracts | T3–T4 | `DataValidator` exists but no `schemas.py`; not wired into `main.py` | T3, T4 | No schema definitions; validator not used in pipeline |
+| M3: Normalization | T5–T7 | `ScheduleNormalizer` exists with 30 airports; not wired into combiners | T5, T6, T7 | `BTSCombiner` calls `preprocess_bts()` not normalizer; only 30 IATA→ICAO |
+| M4: Orchestrator | T8–T9 | No argparse in `main.py`; monolithic `main()` | T8, T9 | No `--stage`, `--dry-run`, `--force` flags |
+| M5: Merge Hardening | T10–T11 | `DataMerger` exists with single tolerance; basic dedup | T10, T11 | No per-region tolerance; no conflict logging |
+| M6: Weather & Labels | T12–T14 | `LabelGenerator` lacks NaT handling; no leakage guard; no diagnostics | T12, T13, T14 | NaT can crash `_compute_delay()`; `actual_dep`/`actual_arr` kept in output |
+| M7: Quality Gates | T15–T16 | Nothing exists | T15, T16 | No `quality_gates.py`; no column ordering |
+| M8: ML Training | T17–T20 | Nothing exists | T17, T18, T19, T20 | No `model_training.py` |
+| M9: Explainability | T21–T22 | Nothing exists | T21, T22 | No SHAP; no feature selection notebook |
+| M10: CI/CD | T23–T29 | No tests directory; unpinned requirements | T23–T29 | No pytest, no CI, no pinned deps |
+| M10b: Drift Detection | T30–T31 | Nothing exists | T30, T31 | No `drift_detector.py` |
+| M11: Streamlit Frontend | FE1–FE8 | Basic single-page `app.py` exists | FE1–FE8 | Not multi-page; no data explorer, no model perf page |
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **M0 (Data Acquisition)** tasks T0A and T0B involve making real API calls to OpenSky Network (rate-limited, potentially days of runtime). T0D calls the IEM ASOS API. I will implement the **CLI code and scripts** but will NOT execute the actual data fetching runs. You'll need to run those yourself.
+
+> [!WARNING]
+> **T1 (Security)**: The `.env` file currently contains real API credentials. The `.gitignore` already lists `.env` and `credentials.json`. The `credentials.json` file does not exist on disk (already deleted). I will fix the null-byte corruption in `.gitignore` and create `docs/SECURITY.md`.
+
+> [!IMPORTANT]
+> **M8 (ML Training)**: Tasks T18-T19 train 4 ML models including XGBoost+LightGBM with Optuna HPO (50 trials each). This requires the ML dataset to exist. The code will be complete but training depends on M0-M7 producing data first.
+
+> [!IMPORTANT]
+> **Notebook T22**: Creating `.ipynb` files programmatically is limited. I will create it as a Python script that can be converted to a notebook, or create the notebook JSON structure directly.
+
+---
+
+## Proposed Changes
+
+### Milestone 1 — Security & Config (T1, T2)
+
+#### [MODIFY] [.gitignore](file:///d:/Desertation/Code_v3/flight-disruption-prediction/.gitignore)
+- Remove null-byte corruption on lines 171-172
+- Ensure `credentials.json`, `.env`, `*.pyc` entries are present (they already are)
+
+#### [NEW] [SECURITY.md](file:///d:/Desertation/Code_v3/flight-disruption-prediction/docs/SECURITY.md)
+- Credential rotation checklist
+- What was exposed, steps for OpenSky API key rotation
+
+#### [MODIFY] [main.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/main.py)
+- Add `from src.config_validator import validate_environment` import
+- Add `set_seed` to the `from src.utils` import line
+
+---
+
+### Milestone 2 — Data Contracts (T3, T4)
+
+#### [NEW] [schemas.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/schemas.py)
+- `ADSB_STATES_SCHEMA`, `TRAJECTORIES_SCHEMA`, `FEATURES_SCHEMA`, `CANONICAL_SCHEDULE_SCHEMA`, `ML_DATASET_SCHEMA`
+- Each entry: `{'dtype': str, 'max_null_pct': float, 'is_utc': bool}`
+- `ML_DATASET_COLUMN_ORDER` list (for T16)
+
+#### [MODIFY] [main.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/main.py)
+- Import `DataValidator` and schemas
+- Insert `.validate()` calls after features, merge, labeling stages
+- Add `validation_mode` config key
+
+#### [MODIFY] [config.yaml](file:///d:/Desertation/Code_v3/flight-disruption-prediction/configs/config.yaml)
+- Add `validation_mode: warn_only`
+
+---
+
+### Milestone 3 — Normalization (T5, T6, T7)
+
+#### [MODIFY] [data_ingestion.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/data_ingestion.py)
+- T5: Wire `ScheduleNormalizer.normalize_bts()` into `BTSCombiner.combine_csvs()` after concat
+- T6: Wire `ScheduleNormalizer.normalize_eurocontrol()` into `EuroCombiner.combine_parquets()` replacing `preprocess_eurocontrol()`
+
+#### [MODIFY] [normalization.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/normalization.py)
+- T7: Expand `IATA_TO_ICAO` from 30 → 150+ airports (top 100 US + top 50 EU)
+- Add fallback log warning for unknown codes
+- Adjust `normalize_eurocontrol()` to handle OPDI column names (`flt_id`, `adep`, `ades`, `first_seen`, `last_seen`)
+
+---
+
+### Milestone 0 — Data Acquisition (T0A, T0B, T0C, T0D)
+
+#### [MODIFY] [opensky_client.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/opensky_client.py)
+- T0A: Add `backfill_date_range(start_date, end_date)` method
+- Fetch daily with UTC midnight boundaries
+- Partition output: `data/raw/opensky/year=YYYY/month=MM/states_YYYYMMDD.parquet`
+- Wire ManifestManager for tracking
+
+#### [MODIFY] [data_ingestion.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/data_ingestion.py)
+- T0A: Add `--source opensky_backfill --backfill-from --backfill-to` CLI options
+- Rate limiting: max 1 request/5s, exponential backoff
+
+#### [MODIFY] [trajectory_builder.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/trajectory_builder.py)
+- T0C: Add `load_partitioned_data()` method using glob `data/raw/opensky/**/states_*.parquet`
+- Incremental loading in batches for memory management
+
+#### [MODIFY] [main.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/main.py)
+- T0C: Update step 3 to use glob-based multi-file loading
+
+#### [NEW] [fetch_weather.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/scripts/fetch_weather.py)
+- T0D: Script calling IEM ASOS API to download real METAR data
+- Map IEM columns to pipeline schema
+- Save to `data/raw/metar_2025.parquet`
+
+#### [MODIFY] [weather.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/weather.py)
+- T0D: Support loading from Parquet (not just CSV)
+
+---
+
+### Milestone 4 — Orchestrator (T8, T9)
+
+#### [MODIFY] [main.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/main.py)
+- T8: Full refactor — add `argparse` with `--stage` flag (`ingest`, `features`, `merge`, `weather`, `label`, `validate`, `train`, `drift`, `all`)
+- Add `--dry-run` flag
+- Refactor monolithic `main()` into separate stage functions
+- Run metadata logging to `logs/run_{timestamp}.json`
+- T9: Output-file existence check before each stage; `--force` flag to override
+
+---
+
+### Milestone 5 — Merge Hardening (T10, T11)
+
+#### [MODIFY] [merge.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/merge.py)
+- T10: Change `tolerance_hours` to accept `dict | int` with per-region lookup
+- T11: Add deterministic Phase A preference for tie-breaking; log one-to-many conflicts
+- Add `one_to_many_conflicts` count to `MergeQA.generate_report()`
+
+#### [MODIFY] [config.yaml](file:///d:/Desertation/Code_v3/flight-disruption-prediction/configs/config.yaml)
+- Add `merge.tolerance_hours` dict with EU/US/default values
+
+---
+
+### Milestone 6 — Weather & Labels (T12, T13, T14)
+
+#### [MODIFY] [labeling.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/labeling.py)
+- T12: Add NaT handling in `_compute_delay()` — return NaN for NaT rows, log count
+- T13: Add `LEAKY_COLUMNS` and `strip_leaky_columns()` method; call in `standardize_dataset()`
+- T14: Add label distribution JSON logging in `generate_labels()`
+
+#### [MODIFY] [weather.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/weather.py)
+- T14: Add weather coverage null% JSON report at end of `add_weather_features()`
+
+---
+
+### Milestone 7 — Quality Gates (T15, T16)
+
+#### [NEW] [quality_gates.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/quality_gates.py)
+- T15: `QualityGateRunner` class with `check_missingness()`, `check_duplicates()`, `check_label_balance()`, `compute_feature_quality_score()`, `run_all()`
+- Adds `training_eligible` and `feature_quality_score` columns
+
+#### [MODIFY] [schemas.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/schemas.py)
+- T16: Add `ML_DATASET_COLUMN_ORDER` list
+
+#### [MODIFY] [main.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/main.py)
+- T16: Before final `to_parquet()`, reorder columns per `ML_DATASET_COLUMN_ORDER`
+
+---
+
+### Milestone 8 — ML Training (T17–T20)
+
+#### [NEW] [model_training.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/model_training.py)
+- T17: `ModelTrainer` class with `prepare_data()` — load, filter, stratified split, impute, scale
+- T18: `train_logistic_regression()`, `train_random_forest()`, `evaluate()`, `save_model()`
+- T19: `train_xgboost()`, `train_lightgbm()` with Optuna 50-trial HPO; `train_all()`
+- T20: `generate_comparison_report()`, confusion matrix heatmaps, ROC curves, model comparison bar chart
+
+#### [MODIFY] [main.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/main.py)
+- Wire `stage_train()` function
+
+---
+
+### Milestone 9 — Explainability (T21, T22)
+
+#### [MODIFY] [model_training.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/model_training.py)
+- T21: Add `explain()` method with SHAP TreeExplainer/LinearExplainer
+- Save `shap_summary.png`, `shap_force_plot_{i}.html`, `shap_values.parquet`
+
+#### [NEW] [06_feature_selection.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/notebooks/06_feature_selection.py)
+- T22: Python script with sections for missingness heatmap, correlation matrices, mutual information, permutation importance, leakage risk table
+
+---
+
+### Milestone 10 — CI/CD & Testing (T23–T29)
+
+#### [NEW] [pytest.ini](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pytest.ini)
+- T23: Test config
+
+#### [NEW] [tests/__init__.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/tests/__init__.py)
+- T23: Empty init
+
+#### [NEW] [conftest.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/tests/conftest.py)
+- T23: Shared fixtures (`sample_adsb_df`, `sample_schedule_df`, `sample_features_df`, `sample_weather_df`)
+
+#### [NEW] [test_data_validator.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/tests/test_data_validator.py)
+- T24: 6 tests for `DataValidator`
+
+#### [NEW] [test_normalization.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/tests/test_normalization.py)
+- T25: 6 tests for `ScheduleNormalizer`
+
+#### [NEW] [test_labeling.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/tests/test_labeling.py)
+- T26: 6 tests for `LabelGenerator`
+
+#### [NEW] [test_quality_gates.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/tests/test_quality_gates.py)
+- T27: 8 tests for `QualityGateRunner`
+
+#### [NEW] [ci.yml](file:///d:/Desertation/Code_v3/flight-disruption-prediction/.github/workflows/ci.yml)
+- T28: GitHub Actions CI with lint, typecheck, test jobs
+
+#### [MODIFY] [requirements.txt](file:///d:/Desertation/Code_v3/flight-disruption-prediction/requirements.txt)
+- T29: Pin all dependencies with `==` versions, add ML/testing/dev deps
+
+---
+
+### Milestone 10b — Drift Detection (T30, T31)
+
+#### [NEW] [drift_detector.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/drift_detector.py)
+- T30: `DriftDetector` class with `compute_psi()`, `compute_ks()`, `monthly_drift_report()`, `stability_ranking()`, `flag_high_importance_unstable()`
+- Drift heatmap PNG output
+
+#### [MODIFY] [main.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/main.py)
+- T31: Add `--stage drift` to orchestrator; `stage_drift()` function
+
+---
+
+### Milestone 11 — Streamlit Frontend (FE1–FE8)
+
+#### [MODIFY] [app.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/app.py)
+- FE1: Refactor to multi-page scaffold with home page, sidebar nav, dark theme
+
+#### [NEW] [streamlit_utils.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/src/streamlit_utils.py)
+- FE1: Shared helpers — `load_dataset()`, `load_model()`, `get_run_metadata()`, `style_page()`
+
+#### [NEW] [1_Pipeline_Overview.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pages/1_Pipeline_Overview.py)
+- FE2: Pipeline stage status, row counts, merge funnel
+
+#### [NEW] [2_Data_Explorer.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pages/2_Data_Explorer.py)
+- FE3: Interactive data browser with filters, CSV download
+
+#### [NEW] [3_Trajectory_Map.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pages/3_Trajectory_Map.py)
+- FE4: Folium trajectory map with altitude profile
+
+#### [NEW] [4_Feature_Analysis.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pages/4_Feature_Analysis.py)
+- FE5: Correlation matrix, importance, SHAP summary
+
+#### [NEW] [5_Model_Performance.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pages/5_Model_Performance.py)
+- FE6: Model comparison table, confusion matrices, ROC curves
+
+#### [NEW] [6_Predictions_Explorer.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pages/6_Predictions_Explorer.py)
+- FE7: Interactive prediction tool with SHAP force plots
+
+#### [NEW] [7_Data_Quality.py](file:///d:/Desertation/Code_v3/flight-disruption-prediction/pages/7_Data_Quality.py)
+- FE8: Quality dashboard — missingness, drift alerts, quality gates
+
+---
+
+## Execution Order
+
+I will implement in dependency order, grouping tasks that can be done together:
+
+```
+Phase 1 (Foundation):     T1, T2, T3, T7, T29
+Phase 2 (Wiring):         T4, T5, T6, T8, T9
+Phase 3 (Data Acq Code):  T0A, T0C, T0D
+Phase 4 (Hardening):      T10, T11, T12, T13, T14
+Phase 5 (Quality):        T15, T16
+Phase 6 (ML):             T17, T18, T19, T20
+Phase 7 (Explainability): T21, T22
+Phase 8 (Testing):        T23, T24, T25, T26, T27, T28
+Phase 9 (Drift):          T30, T31
+Phase 10 (Frontend):      FE1, FE2, FE3, FE4, FE5, FE6, FE7, FE8
+```
+
+> T0B is omitted — it's a manual long-running data fetch that you execute yourself.
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> 1. **Should I skip T0B entirely?** It's a multi-day data download operation. I'll build the CLI (T0A) so you can run it yourself.
+> 2. **Notebook format for T22**: Would you prefer a `.py` script (easier to create/maintain) or a proper `.ipynb` Jupyter notebook?
+> 3. **Should I use `pip freeze` to get your current exact versions** for T29, or pin to latest stable versions?
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- `python -c "import ast; ast.parse(open('main.py').read()); print('OK')"` — AST validation after T2
+- `pytest --collect-only` — test infrastructure after T23
+- `pytest -v` — all unit tests after T24-T27
+- `python -c "from src.schemas import ADSB_STATES_SCHEMA, ML_DATASET_SCHEMA; print('OK')"` — schema imports after T3
+- `python -c "from src.quality_gates import QualityGateRunner; print('OK')"` — quality gates after T15
+- `python -c "from src.model_training import ModelTrainer; print('OK')"` — ML module after T17
+- `python -c "from src.drift_detector import DriftDetector; print('OK')"` — drift module after T30
+
+### Manual Verification
+- Run `python main.py --help` to verify CLI after T8
+- Run `streamlit run app.py` to verify frontend after FE1-FE8
+- Run `python main.py --stage all` for end-to-end pipeline (requires data from M0)

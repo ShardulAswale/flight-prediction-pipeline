@@ -39,6 +39,7 @@ class OpenSkyClient:
         self.client_secret = client_secret
         self.bbox = bbox
         self.token: Optional[str] = None
+        self.last_status_code: Optional[int] = None
         self._authenticate()
 
     def _authenticate(self) -> None:
@@ -84,7 +85,9 @@ class OpenSkyClient:
             headers["Authorization"] = f"Bearer {self.token}"
             
         try:
+            self.last_status_code = None
             response = requests.get(self.API_URL, params=params, headers=headers, timeout=15)
+            self.last_status_code = response.status_code
             
             # Handle token expiration dynamically
             if response.status_code == 401 and self.client_id:
@@ -93,6 +96,7 @@ class OpenSkyClient:
                 if self.token:
                     headers["Authorization"] = f"Bearer {self.token}"
                     response = requests.get(self.API_URL, params=params, headers=headers, timeout=15)
+                    self.last_status_code = response.status_code
                     
             response.raise_for_status()
             data = response.json()
@@ -105,6 +109,8 @@ class OpenSkyClient:
             return None
             
         except requests.RequestException as e:
+            if e.response is not None:
+                self.last_status_code = e.response.status_code
             logger.warning(f"Failed to fetch states at {timestamp}: {e}")
             return None
 
@@ -126,6 +132,9 @@ class OpenSkyClient:
         
         for ts in tqdm(timestamps, desc="Fetching OpenSky Data"):
             df = self.fetch_states(ts)
+            if getattr(self, 'last_status_code', None) == 403:
+                logger.warning("Encountered repeated HTTP 403 while fetching range; stopping further requests.")
+                break
             if df is not None:
                 all_states.append(df)
             time.sleep(1) # Polite sleep for rate limiting, anonymous API rate limit is 400 requests/day
