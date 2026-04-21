@@ -111,6 +111,7 @@ credentials.json
 .env
 .venv
 .venv11/
+.venv311/
 env/
 venv/
 ENV/
@@ -118,6 +119,8 @@ env.bak/
 venv.bak/
 .ptmp/
 .tmp/
+.pytest_tmp/
+.pytest_tmp_run/
 
 # Spyder project settings
 .spyderproject

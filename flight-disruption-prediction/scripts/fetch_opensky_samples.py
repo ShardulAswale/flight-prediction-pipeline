@@ -1,6 +1,7 @@
 import argparse
 import logging
 import sys
+import time
 import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -154,17 +155,46 @@ def download_archive(date_str: str, hour: int, archive_dir: Path, url_template: 
 
     ensure_dir(archive_dir)
     url = url_template.format(date=date_str, hour=hour)
-    logger.info("Downloading %s", url)
-    response = requests.get(url, timeout=180)
+    part_path = archive_path.with_suffix(archive_path.suffix + ".part")
+    max_attempts = 4
 
-    if response.status_code == 404:
-        logger.warning("Sample file not found for %s hour %02d", date_str, hour)
-        return None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info("Downloading %s (attempt %s/%s)", url, attempt, max_attempts)
+            with requests.get(url, timeout=(30, 300), stream=True) as response:
+                if response.status_code == 404:
+                    logger.warning("Sample file not found for %s hour %02d", date_str, hour)
+                    return None
 
-    response.raise_for_status()
-    archive_path.write_bytes(response.content)
-    logger.info("Saved archive to %s", archive_path)
-    return archive_path
+                response.raise_for_status()
+                if part_path.exists():
+                    part_path.unlink()
+                with part_path.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+
+            part_path.replace(archive_path)
+            logger.info("Saved archive to %s", archive_path)
+            return archive_path
+        except (requests.RequestException, OSError) as exc:
+            if part_path.exists():
+                part_path.unlink()
+            if attempt == max_attempts:
+                raise
+            sleep_seconds = min(60, 5 * attempt)
+            logger.warning(
+                "Download failed for %s hour %02d on attempt %s/%s: %s. Retrying in %ss.",
+                date_str,
+                hour,
+                attempt,
+                max_attempts,
+                exc,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    return None
 
 
 def load_archive_frame(archive_path: Path, date_str: str, hour: int) -> pd.DataFrame:

@@ -102,18 +102,40 @@ class EurocontrolDownloader:
                 f.write(chunk)
                 
     def download_month(self, year: int, month: int, base_output_dir: str | Path) -> Optional[Path]:
-        """Download Eurocontrol flight list Parquet for a specific month with partitioning."""
+        """Download Eurocontrol flight list Parquet for a specific month.
+
+        Eurocontrol already provides one file per month, so a flat raw layout is
+        clearer than an extra ``year=/month=`` partition directory:
+
+        ``data/raw/eurocontrol/euro_flight_list_202201.parquet``
+
+        Existing legacy partitioned files are still reused to avoid unnecessary
+        downloads.
+        """
         yyyymm = f"{year}{month:02d}"
         url = self.BASE_URL.format(YYYYMM=yyyymm)
         
-        output_dir = Path(base_output_dir) / 'eurocontrol' / f'year={year}' / f'month={month:02d}'
+        output_dir = Path(base_output_dir) / 'eurocontrol'
         ensure_dir(output_dir)
         
         file_path = output_dir / f"euro_flight_list_{yyyymm}.parquet"
+        legacy_file_path = (
+            Path(base_output_dir)
+            / 'eurocontrol'
+            / f'year={year}'
+            / f'month={month:02d}'
+            / f"euro_flight_list_{yyyymm}.parquet"
+        )
         
         if file_path.exists():
             logger.info(f"File {file_path.name} already exists. Skipping download.")
             return file_path
+        if legacy_file_path.exists():
+            logger.info(
+                "Found legacy partitioned Eurocontrol file %s. Reusing it; new downloads will use flat layout.",
+                legacy_file_path,
+            )
+            return legacy_file_path
 
         logger.info(f"Downloading Eurocontrol data from {url}...")
         try:
@@ -155,19 +177,43 @@ class BTSDownloader:
                     f.write(chunk)
 
     def download_month(self, year: int, month: int, base_output_dir: str | Path) -> Optional[Path]:
-        output_dir = Path(base_output_dir) / 'bts' / f'year={year}' / f'month={month:02d}'
+        """Download/extract one BTS month using a flat raw layout.
+
+        BTS is naturally one ZIP/CSV per month, so the preferred layout is:
+
+        ``data/raw/bts/bts_on_time_2022_01.zip``
+        ``data/raw/bts/On_Time_Reporting_..._2022_1.csv``
+
+        Existing legacy ``year=/month=`` files are still reused.
+        """
+        output_dir = Path(base_output_dir) / 'bts'
         ensure_dir(output_dir)
         
         file_path = output_dir / f"bts_on_time_{year}_{month:02d}.zip"
         csv_name = f"On_Time_Reporting_Carrier_On_Time_Performance_(1987_present)_{year}_{month}.csv"
         csv_path = output_dir / csv_name
+        legacy_output_dir = Path(base_output_dir) / 'bts' / f'year={year}' / f'month={month:02d}'
+        legacy_file_path = legacy_output_dir / f"bts_on_time_{year}_{month:02d}.zip"
+        legacy_csv_path = legacy_output_dir / csv_name
         
         if csv_path.exists() and csv_path.stat().st_size > 1000000:
             logger.info(f"CSV {csv_path.name} already exists. Skipping download.")
             return csv_path
+        if legacy_csv_path.exists() and legacy_csv_path.stat().st_size > 1000000:
+            logger.info(
+                "Found legacy partitioned BTS CSV %s. Reusing it; new downloads will use flat layout.",
+                legacy_csv_path,
+            )
+            return legacy_csv_path
 
         if file_path.exists() and file_path.stat().st_size > 1000000:
             logger.info(f"ZIP {file_path.name} already exists. Reusing archive.")
+        elif legacy_file_path.exists() and legacy_file_path.stat().st_size > 1000000:
+            logger.info(
+                "Found legacy partitioned BTS ZIP %s. Reusing it for extraction into flat layout.",
+                legacy_file_path,
+            )
+            file_path = legacy_file_path
         else:
             url = self.BASE_URL.format(year=year, month=month)
             logger.info(f"Downloading BTS data from {url}...")

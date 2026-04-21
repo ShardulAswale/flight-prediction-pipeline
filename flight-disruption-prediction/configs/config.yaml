@@ -12,15 +12,53 @@ opensky:
 
 trajectory:
   max_gap_minutes: 15
+  batch_size: 200000
+  reconstruction_workers: 4
+  reconstruction_partitions: 16
+
+features:
+  # Fast path: avoid writing full point-level trajectories.parquet.
+  # Flow: schedule callsigns/time windows -> ADS-B filter -> downsample -> one feature row per observed scheduled flight.
+  mode: "schedule_aware_direct"
+  schedule_sources: ["bts"]
+  batch_size: 200000
+  partitions: 16
+  pre_departure_hours: 2
+  post_arrival_hours: 3
+  fallback_duration_hours: 3
+  downsample_interval_seconds: 60
+  phase_detail_minutes: 15
+  phase_interval_seconds: 30
+  max_points_per_flight: 300
+  min_points_per_flight: 10
+  save_trajectory_sketches: true
+  # Retain route geometry for maps, route deviation, and en-route weather.
+  # The feature extractor can use denser points, but sketches are kept coarse.
+  sketch_interval_seconds: 600
+  sketch_phase_interval_seconds: 120
+  sketch_phase_detail_minutes: 15
+  sketch_max_points_per_flight: 80
+  sketch_output_file: "trajectory_sketches.parquet"
+  cleanup_work_dir: false
 
 ingestion:
   year: 2022
-  start_month: 5
-  end_month: 5
+  start_month: 1
+  end_month: 6
   adsb_combined_file: "data/processed/adsb_combined.parquet"
   bts_csv_dir: "data/raw/bts"
   bts_combined_file: "data/processed/bts_combined.parquet"
   euro_combined_file: "data/processed/eurocontrol_combined.parquet"
+  master_control:
+    start_date: "2022-01-01"
+    end_date: "2022-06-30"
+    sources: ["opensky", "bts", "eurocontrol"]
+    hour_start: 0
+    hour_end: 23
+    max_workers: 8
+    combine_outputs: true
+    outputs_dir: "outputs/ingestion_control"
+    opensky_url_template: "https://s3.opensky-network.org/data-samples/states/{date}/{hour:02d}/states_{date}-{hour:02d}.avro.tar"
 
 # T10: Per-region merge tolerance
 merge:
@@ -28,6 +66,7 @@ merge:
     EU: 2
     US: 3
     default: 2
+  schedule_sources: ["bts"]
 
 paths:
   data_dir: "data"
@@ -37,13 +76,37 @@ paths:
   opensky_data_file: "adsb_states.parquet"
   trajectories_file: "trajectories.parquet"
   features_file: "trajectory_features.parquet"
+  trajectory_sketches_file: "trajectory_sketches.parquet"
   ml_dataset_file: "ml_dataset.parquet"
   metar_data_file: "data/raw/metar.parquet"  # IATA-coded METAR observations
+
+enroute_weather:
+  # Disabled by default because external lat/lon/time weather lookup can create
+  # many API requests. Enable after trajectory_sketches.parquet exists.
+  enabled: false
+  provider: "open_meteo"
+  cache_dir: "data/raw/enroute_weather_cache"
+  max_flights:
+  max_points_per_flight: 24
+  request_sleep_seconds: 0.05
+  round_latlon_decimals: 2
+  round_time: "1h"
+  timeout_seconds: 30
+  force_refresh: false
 
 # T4: Validation mode
 validation_mode: warn_only
 
 training:
-  use_gpu: false
+  use_gpu: True
+  # Keep first-pass training fast and reproducible. LightGBM/CatBoost can be
+  # re-enabled for a final benchmark once the feature set is locked.
+  enabled_models: ["logistic_regression", "random_forest", "xgboost"]
+  optuna_trials: 10
+  xgboost_trials: 10
+  lightgbm_trials: 5
+  # These are useful later only if computed leave-one-out or time-lagged.
+  # The current full-dataset rates are excluded to avoid target leakage.
+  exclude_features: ["origin_delay_rate", "dest_delay_rate"]
 
 seed: 42

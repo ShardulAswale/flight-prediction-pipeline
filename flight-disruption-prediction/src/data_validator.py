@@ -4,8 +4,33 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
+from pandas.api.types import is_object_dtype, is_string_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def _dtype_matches(expected_dtype: str | None, actual_series: pd.Series) -> bool:
+    """Return True when the actual pandas dtype is compatible with the schema.
+
+    Pandas may report text columns as ``object``, ``str``, ``string``, or
+    ``string[python]`` depending on construction and parquet round-tripping.
+    Those are semantically equivalent for this pipeline.
+    """
+    if not expected_dtype:
+        return True
+
+    expected = str(expected_dtype).lower()
+    actual = str(actual_series.dtype).lower()
+
+    if expected in actual:
+        return True
+    if expected in {"object", "str", "string"} and (
+        is_object_dtype(actual_series) or is_string_dtype(actual_series)
+    ):
+        return True
+    if expected.startswith("datetime") and actual.startswith("datetime"):
+        return True
+    return expected == actual
 
 class DataValidator:
     """
@@ -68,13 +93,10 @@ class DataValidator:
             # 2. Check DType
             expected_dtype = rules.get('dtype')
             actual_dtype = str(df[col].dtype)
-            if expected_dtype and expected_dtype not in actual_dtype:
-                # Be flexible with datetime / object strings for now, strict otherwise
-                if not (expected_dtype.startswith('datetime') and actual_dtype.startswith('datetime')):
-                    if expected_dtype != actual_dtype:
-                        is_valid = False
-                        msg = f"Column '{col}' expected dtype '{expected_dtype}', got '{actual_dtype}'"
-                        errors.append({'type': 'dtype_mismatch', 'column': col, 'message': msg})
+            if not _dtype_matches(expected_dtype, df[col]):
+                is_valid = False
+                msg = f"Column '{col}' expected dtype '{expected_dtype}', got '{actual_dtype}'"
+                errors.append({'type': 'dtype_mismatch', 'column': col, 'message': msg})
             
             # 3. Check Null Threshold
             max_null_pct = rules.get('max_null_pct', 0.0)

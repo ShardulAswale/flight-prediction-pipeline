@@ -72,6 +72,20 @@ FEATURES_SCHEMA = {
     'holding_pattern_count': {'dtype': 'int64',    'max_null_pct': 0.0,  'is_utc': False},
     'altitude_change_count': {'dtype': 'int64',    'max_null_pct': 0.0,  'is_utc': False},
     'unstable_descent_flag': {'dtype': 'bool',     'max_null_pct': 0.0,  'is_utc': False},
+    # Compact route geometry retained outside this feature table in
+    # trajectory_sketches.parquet; these optional columns are populated after
+    # en-route weather enrichment.
+    'enroute_weather_point_count':      {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_weather_coverage_ratio':   {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_temperature_mean':         {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_temperature_min':          {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_temperature_max':          {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_wind_speed_mean':          {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_wind_speed_max':           {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_precipitation_mean':       {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_precipitation_max':        {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_weather_severity_mean':    {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_weather_severity_max':     {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
 }
 
 # ── Stage 4: Canonical Schedule ──────────────────────────────────────────
@@ -150,6 +164,18 @@ ML_DATASET_SCHEMA = {
     'temperature_dest':        {'dtype': 'float64',  'max_null_pct': 0.80, 'is_utc': False},
     'precipitation_dest':      {'dtype': 'float64',  'max_null_pct': 0.80, 'is_utc': False},
     'weather_severity_dest':   {'dtype': 'float64',  'max_null_pct': 0.80, 'is_utc': False},
+    # En-route weather sampled from retained trajectory sketches.
+    'enroute_weather_point_count':      {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_weather_coverage_ratio':   {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_temperature_mean':         {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_temperature_min':          {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_temperature_max':          {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_wind_speed_mean':          {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_wind_speed_max':           {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_precipitation_mean':       {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_precipitation_max':        {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_weather_severity_mean':    {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
+    'enroute_weather_severity_max':     {'dtype': 'float64', 'max_null_pct': 1.0, 'is_utc': False},
     # Route Deviation
     'lateral_deviation_mean_km': {'dtype': 'float64', 'max_null_pct': 0.95, 'is_utc': False},
     'lateral_deviation_max_km':  {'dtype': 'float64', 'max_null_pct': 0.95, 'is_utc': False},
@@ -242,6 +268,12 @@ ML_FEATURE_COLUMNS = [
     # Destination weather
     'wind_speed_dest', 'visibility_dest', 'temperature_dest', 'precipitation_dest',
     'weather_severity_dest',
+    # En-route weather
+    'enroute_weather_point_count', 'enroute_weather_coverage_ratio',
+    'enroute_temperature_mean', 'enroute_temperature_min', 'enroute_temperature_max',
+    'enroute_wind_speed_mean', 'enroute_wind_speed_max',
+    'enroute_precipitation_mean', 'enroute_precipitation_max',
+    'enroute_weather_severity_mean', 'enroute_weather_severity_max',
 ]
 
 # ── Feature categories (for grouped importance analysis, Task 5.4) ───────
@@ -274,6 +306,13 @@ ML_FEATURE_CATEGORIES = {
     'weather_dest': [
         'wind_speed_dest', 'visibility_dest', 'temperature_dest',
         'precipitation_dest', 'weather_severity_dest',
+    ],
+    'weather_enroute': [
+        'enroute_weather_point_count', 'enroute_weather_coverage_ratio',
+        'enroute_temperature_mean', 'enroute_temperature_min', 'enroute_temperature_max',
+        'enroute_wind_speed_mean', 'enroute_wind_speed_max',
+        'enroute_precipitation_mean', 'enroute_precipitation_max',
+        'enroute_weather_severity_mean', 'enroute_weather_severity_max',
     ],
 }
 

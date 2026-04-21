@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -1481,7 +1483,11 @@ def reconstruct_full_dataset(
                         and float(last_altitude) <= ctx.thresholds.ground_altitude_threshold_m
                     )
                     inactive_seconds = last_batch_max_timestamp - float(active_max_timestamp)
-                    if ends_groundish and inactive_seconds > max(max_gap_seconds * 4, 3600):
+                    groundish_flush_seconds = max(max_gap_seconds * 4, 3600)
+                    partial_flush_seconds = max(max_gap_seconds * 24, 6 * 3600)
+                    if inactive_seconds > groundish_flush_seconds and (
+                        ends_groundish or inactive_seconds > partial_flush_seconds
+                    ):
                         stale_icao24s.append(icao24_key)
 
                 for icao24_key in stale_icao24s:
@@ -1493,10 +1499,22 @@ def reconstruct_full_dataset(
             write_outputs(batch_outputs)
 
         final_outputs: list[pd.DataFrame] = []
-        for icao24_key, active_segment in list(active_by_icao24.items()):
+        final_active_count = len(active_by_icao24)
+        logger.info('Finalizing %d active aircraft traces for %s.', final_active_count, ctx.adsb_input_path.name)
+        for final_index, (icao24_key, active_segment) in enumerate(list(active_by_icao24.items()), start=1):
             cleaned_segment = materialize_segment(icao24_key, active_segment)
             if cleaned_segment is not None:
                 final_outputs.append(cleaned_segment)
+            if len(final_outputs) >= 250:
+                write_outputs(final_outputs)
+                final_outputs.clear()
+            if final_index == 1 or final_index % 1000 == 0:
+                logger.info(
+                    'Finalized %d/%d active traces for %s.',
+                    final_index,
+                    final_active_count,
+                    ctx.adsb_input_path.name,
+                )
         active_by_icao24.clear()
         write_outputs(final_outputs)
     finally:
@@ -1522,6 +1540,201 @@ def reconstruct_full_dataset(
     _PROTOTYPE_CACHE.clear()
 
     return output_path, pd.DataFrame(trajectory_quality_rows)
+
+
+def _partition_adsb_by_icao24(
+    input_path: Path,
+    partition_dir: Path,
+    *,
+    partitions: int,
+    batch_size: int,
+) -> list[Path]:
+    parquet_file = pq.ParquetFile(input_path)
+    columns = parquet_file.schema.names
+    if 'icao24' not in columns:
+        raise ValueError("ADS-B input must include an 'icao24' column for parallel partitioning.")
+
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    writers: dict[int, pq.ParquetWriter] = {}
+    partition_paths = [partition_dir / f'adsb_part_{idx:03d}.parquet' for idx in range(partitions)]
+
+    processed_rows = 0
+    batch_index = 0
+
+    try:
+        for record_batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+            batch_index += 1
+            df_batch = record_batch.to_pandas()
+            if df_batch.empty:
+                continue
+
+            icao_key = df_batch['icao24'].astype('string').str.strip().str.lower().fillna('missing')
+            hash_values = pd.util.hash_pandas_object(icao_key, index=False).to_numpy(dtype='uint64')
+            df_batch['_partition_id'] = (hash_values % partitions).astype('int64')
+
+            for partition_id, df_part in df_batch.groupby('_partition_id', sort=False):
+                partition_id = int(partition_id)
+                df_part = df_part.drop(columns=['_partition_id'])
+                table = pa.Table.from_pandas(df_part, preserve_index=False)
+                if partition_id not in writers:
+                    writers[partition_id] = pq.ParquetWriter(partition_paths[partition_id], table.schema, compression='snappy')
+                writers[partition_id].write_table(table)
+
+            processed_rows += len(df_batch)
+            if batch_index == 1 or batch_index % 25 == 0:
+                logger.info(
+                    'Partitioned ADS-B batch %d (%s rows so far) into %d shards.',
+                    batch_index,
+                    f'{processed_rows:,}',
+                    partitions,
+                )
+    finally:
+        for writer in writers.values():
+            writer.close()
+
+    return [path for path in partition_paths if path.exists()]
+
+
+def _reconstruct_partition_worker(args: tuple[str, str, str, dict[str, Any], int, int | None]) -> tuple[str, str, list[dict[str, Any]], int]:
+    input_path_str, output_path_str, project_root_str, config, batch_size, max_gap_minutes = args
+    ctx = build_notebook_context(Path(project_root_str))
+    ctx.config = config
+    ctx.adsb_input_path = Path(input_path_str)
+    ctx.traj_path = Path(output_path_str)
+    output_path, quality_df = reconstruct_full_dataset(ctx, batch_size=batch_size, max_gap_minutes=max_gap_minutes)
+    row_count = pq.ParquetFile(output_path).metadata.num_rows if output_path.exists() else 0
+    return str(input_path_str), str(output_path), quality_df.to_dict('records'), int(row_count)
+
+
+def reconstruct_full_dataset_parallel(
+    ctx: TrajectoryNotebookContext,
+    *,
+    workers: int = 4,
+    partitions: int = 8,
+    batch_size: int = 200_000,
+    max_gap_minutes: int | None = None,
+    keep_intermediate: bool = False,
+) -> tuple[Path, pd.DataFrame]:
+    """Reconstruct trajectories using aircraft-hash partitions processed in parallel.
+
+    Every `icao24` is assigned to exactly one partition, so each worker still sees a
+    complete per-aircraft timeline. This preserves trajectory correctness while using
+    multiple CPU cores.
+    """
+    if not ctx.adsb_input_path.exists():
+        raise FileNotFoundError(f'ADS-B input not found: {ctx.adsb_input_path}')
+
+    workers = max(1, int(workers))
+    partitions = max(workers, int(partitions))
+    if workers == 1 or partitions == 1:
+        return reconstruct_full_dataset(ctx, batch_size=batch_size, max_gap_minutes=max_gap_minutes)
+
+    output_path = ctx.traj_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    work_dir = output_path.parent / f'_{output_path.stem}_parallel_work'
+    partition_dir = work_dir / 'input_partitions'
+    output_dir = work_dir / 'trajectory_partitions'
+
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    partition_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        'Partitioning ADS-B input by icao24 into %d shards for %d workers...',
+        partitions,
+        workers,
+    )
+    partition_paths = _partition_adsb_by_icao24(
+        ctx.adsb_input_path,
+        partition_dir,
+        partitions=partitions,
+        batch_size=batch_size,
+    )
+    if not partition_paths:
+        raise ValueError('No partition files were created from ADS-B input.')
+
+    worker_args = [
+        (
+            str(partition_path),
+            str(output_dir / f'trajectories_part_{idx:03d}.parquet'),
+            str(ctx.project_root),
+            ctx.config,
+            batch_size,
+            max_gap_minutes,
+        )
+        for idx, partition_path in enumerate(partition_paths)
+    ]
+
+    quality_rows: list[dict[str, Any]] = []
+    output_parts: list[Path] = []
+
+    def collect_worker_result(result: tuple[str, str, list[dict[str, Any]], int]) -> None:
+        input_part, output_part, part_quality_rows, row_count = result
+        logger.info('Finished %s -> %s (%d rows, %d quality summaries).', input_part, output_part, row_count, len(part_quality_rows))
+        output_parts.append(Path(output_part))
+        quality_rows.extend(part_quality_rows)
+
+    try:
+        with ProcessPoolExecutor(max_workers=min(workers, len(worker_args))) as executor:
+            futures = [executor.submit(_reconstruct_partition_worker, args) for args in worker_args]
+            for future in as_completed(futures):
+                collect_worker_result(future.result())
+    except (OSError, PermissionError) as exc:
+        logger.warning(
+            'Parallel worker startup failed (%s). Falling back to serial partition processing.',
+            exc,
+        )
+        for args in worker_args:
+            collect_worker_result(_reconstruct_partition_worker(args))
+
+    output_parts = [path for path in output_parts if path.exists()]
+    if not output_parts:
+        raise ValueError('No cleaned trajectory partition outputs were produced.')
+
+    temp_output_path = output_path.with_name(f'{output_path.stem}.tmp{output_path.suffix}')
+    if temp_output_path.exists():
+        temp_output_path.unlink()
+
+    writer: pq.ParquetWriter | None = None
+    total_output_rows = 0
+    try:
+        for part_path in sorted(output_parts):
+            part_file = pq.ParquetFile(part_path)
+            for record_batch in part_file.iter_batches(batch_size=batch_size):
+                table = pa.Table.from_batches([record_batch])
+                if writer is None:
+                    writer = pq.ParquetWriter(temp_output_path, table.schema, compression='snappy')
+                elif table.schema != writer.schema:
+                    table = table.cast(writer.schema, safe=False)
+                writer.write_table(table)
+                total_output_rows += table.num_rows
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if total_output_rows == 0:
+        if temp_output_path.exists():
+            temp_output_path.unlink()
+        raise ValueError('No cleaned trajectory rows were produced during parallel reconstruction.')
+
+    backup_path = output_path.with_name(f'{output_path.stem}.bak{output_path.suffix}')
+    if backup_path.exists():
+        backup_path.unlink()
+    if output_path.exists():
+        output_path.replace(backup_path)
+    temp_output_path.replace(output_path)
+    if backup_path.exists():
+        backup_path.unlink()
+
+    if not keep_intermediate:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    _INSPECT_CACHE.clear()
+    _SAMPLE_CACHE.clear()
+    _PROTOTYPE_CACHE.clear()
+
+    return output_path, pd.DataFrame(quality_rows)
 
 class TrajectoryBuilder:
     """Legacy simple trajectory builder kept for backward compatibility."""
@@ -1616,6 +1829,7 @@ __all__ = [
     'inspect_adsb_source',
     'make_prototype_controls',
     'reconstruct_full_dataset',
+    'reconstruct_full_dataset_parallel',
     'summarize_partial_status_from_parquet',
     'summarize_prototype_segments',
 ]

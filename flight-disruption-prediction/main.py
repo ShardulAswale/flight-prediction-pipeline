@@ -17,7 +17,8 @@ from pathlib import Path
 from datetime import datetime
 
 from src.feature_engineering import FeatureExtractor
-from src.trajectory_builder import build_notebook_context, reconstruct_full_dataset
+from src.schedule_aware_features import ScheduleAwareFeatureConfig, extract_schedule_aware_features
+from src.trajectory_builder import build_notebook_context, reconstruct_full_dataset, reconstruct_full_dataset_parallel
 from src.merge import DataMerger
 from src.weather import WeatherIntegrator
 from src.labeling import LabelGenerator
@@ -257,10 +258,70 @@ def stage_features(config: dict, validator: DataValidator, force: bool = False):
     ingest_cfg = config.get('ingestion', {})
     traj_path = Path(paths['processed_data_dir']) / paths['trajectories_file']
     adsb_combined_path = Path(ingest_cfg.get('adsb_combined_file', 'data/processed/adsb_combined.parquet'))
+    features_path = Path(paths['processed_data_dir']) / paths['features_file']
 
     if not adsb_combined_path.exists():
         logger.error(f"No trajectory data found. Run data acquisition first.")
         _log_run_metadata('features', start, 'FAILED')
+        return
+
+    feature_cfg = config.get('features', {})
+    feature_mode = str(feature_cfg.get('mode', 'trajectory_reconstruction')).lower()
+
+    if feature_mode in {'schedule_aware_direct', 'schedule_aware', 'direct'}:
+        logger.info("Running schedule-aware direct ADS-B feature extraction...")
+        direct_cfg = ScheduleAwareFeatureConfig(
+            batch_size=int(feature_cfg.get('batch_size', config.get('trajectory', {}).get('batch_size', 200_000))),
+            partitions=int(feature_cfg.get('partitions', config.get('trajectory', {}).get('reconstruction_partitions', 16))),
+            pre_departure_hours=float(feature_cfg.get('pre_departure_hours', 2.0)),
+            post_arrival_hours=float(feature_cfg.get('post_arrival_hours', 3.0)),
+            fallback_duration_hours=float(feature_cfg.get('fallback_duration_hours', 3.0)),
+            downsample_interval_seconds=int(feature_cfg.get('downsample_interval_seconds', 60)),
+            phase_detail_minutes=int(feature_cfg.get('phase_detail_minutes', 15)),
+            phase_interval_seconds=int(feature_cfg.get('phase_interval_seconds', 30)),
+            max_points_per_flight=int(feature_cfg.get('max_points_per_flight', 300)),
+            min_points_per_flight=int(feature_cfg.get('min_points_per_flight', 10)),
+            save_trajectory_sketches=bool(feature_cfg.get('save_trajectory_sketches', True)),
+            sketch_interval_seconds=int(feature_cfg.get('sketch_interval_seconds', 600)),
+            sketch_phase_interval_seconds=int(feature_cfg.get('sketch_phase_interval_seconds', 120)),
+            sketch_phase_detail_minutes=int(feature_cfg.get('sketch_phase_detail_minutes', 15)),
+            sketch_max_points_per_flight=int(feature_cfg.get('sketch_max_points_per_flight', 80)),
+            sketch_output_file=str(feature_cfg.get('sketch_output_file', 'trajectory_sketches.parquet')),
+            max_schedule_rows=feature_cfg.get('max_schedule_rows'),
+            schedule_sources=tuple(feature_cfg.get('schedule_sources', ['bts'])),
+            cleanup_work_dir=bool(feature_cfg.get('cleanup_work_dir', False)),
+            force_repartition=bool(force or feature_cfg.get('force_repartition', False)),
+        )
+        if direct_cfg.max_schedule_rows is not None:
+            direct_cfg = ScheduleAwareFeatureConfig(
+                **{
+                    **direct_cfg.__dict__,
+                    'max_schedule_rows': int(direct_cfg.max_schedule_rows),
+                }
+            )
+
+        schedule_paths = {
+            'bts': ingest_cfg.get('bts_combined_file', 'data/processed/bts_combined.parquet'),
+            'eurocontrol': ingest_cfg.get('euro_combined_file', 'data/processed/eurocontrol_combined.parquet'),
+        }
+        df_features = extract_schedule_aware_features(
+            adsb_path=adsb_combined_path,
+            schedule_paths=schedule_paths,
+            output_path=features_path,
+            work_dir=Path(paths['processed_data_dir']) / '_schedule_aware_work',
+            config=direct_cfg,
+            max_gap_minutes=config.get('trajectory', {}).get('max_gap_minutes', 15),
+        )
+
+        validator.validate(df_features, FEATURES_SCHEMA, 'trajectory_features')
+        logger.info(f"Features saved to {features_path} ({len(df_features)} rows)")
+        _log_run_metadata(
+            'features',
+            start,
+            'SUCCESS',
+            len(df_features),
+            {'feature_mode': feature_mode, 'schedule_sources': list(direct_cfg.schedule_sources)},
+        )
         return
 
     require_traj_cols = {
@@ -285,11 +346,22 @@ def stage_features(config: dict, validator: DataValidator, force: bool = False):
         ctx.config = config
         ctx.adsb_input_path = adsb_combined_path.resolve()
         ctx.traj_path = traj_path.resolve()
-        output_path, df_traj_quality = reconstruct_full_dataset(
-            ctx,
-            batch_size=config.get('trajectory', {}).get('batch_size', 200_000),
-            max_gap_minutes=config.get('trajectory', {}).get('max_gap_minutes', 15),
-        )
+        trajectory_cfg = config.get('trajectory', {})
+        reconstruction_workers = int(trajectory_cfg.get('reconstruction_workers', 1))
+        reconstruction_partitions = int(trajectory_cfg.get('reconstruction_partitions', max(reconstruction_workers, 1)))
+        reconstruction_fn = reconstruct_full_dataset_parallel if reconstruction_workers > 1 else reconstruct_full_dataset
+        reconstruction_kwargs = {
+            'batch_size': trajectory_cfg.get('batch_size', 200_000),
+            'max_gap_minutes': trajectory_cfg.get('max_gap_minutes', 15),
+        }
+        if reconstruction_fn is reconstruct_full_dataset_parallel:
+            reconstruction_kwargs.update(
+                {
+                    'workers': reconstruction_workers,
+                    'partitions': reconstruction_partitions,
+                }
+            )
+        output_path, df_traj_quality = reconstruction_fn(ctx, **reconstruction_kwargs)
         logger.info("Reconstructed trajectories written to %s (%d quality summaries).", output_path, len(df_traj_quality))
     else:
         logger.info(f"Using existing quality-aware trajectories from {traj_path}...")
@@ -330,7 +402,6 @@ def stage_features(config: dict, validator: DataValidator, force: bool = False):
     validator.validate(df_features, FEATURES_SCHEMA, 'trajectory_features')
     
     # Save features
-    features_path = Path(paths['processed_data_dir']) / paths['features_file']
     ensure_dir(features_path.parent)
     df_features.to_parquet(features_path, index=False)
     logger.info(f"Features saved to {features_path} ({len(df_features)} rows)")
@@ -359,11 +430,12 @@ def stage_merge(config: dict, validator: DataValidator, force: bool = False):
     
     # T10: Per-region tolerance
     tolerance_hours = merge_cfg.get('tolerance_hours', 2)
+    merge_sources = {str(source).lower() for source in merge_cfg.get('schedule_sources', ['eurocontrol', 'bts'])}
     merger = DataMerger(tolerance_hours=tolerance_hours)
     merged_dfs = []
     
     euro_combined_file = Path(ingest_cfg.get('euro_combined_file', 'data/processed/eurocontrol_combined.parquet'))
-    if euro_combined_file.exists():
+    if 'eurocontrol' in merge_sources and euro_combined_file.exists():
         logger.info(f"  Merger: Processing Eurocontrol data from {euro_combined_file}...")
         df_euro = pd.read_parquet(euro_combined_file)
         if 'region' not in df_euro.columns:
@@ -375,9 +447,11 @@ def stage_merge(config: dict, validator: DataValidator, force: bool = False):
             merged_dfs.append(df_matched)
 
         del df_euro, df_matched
+    elif 'eurocontrol' not in merge_sources:
+        logger.info("  Merger: Skipping Eurocontrol because merge.schedule_sources excludes it.")
 
     bts_combined_file = Path(ingest_cfg.get('bts_combined_file', 'data/processed/bts_combined.parquet'))
-    if bts_combined_file.exists():
+    if 'bts' in merge_sources and bts_combined_file.exists():
         logger.info(f"  Merger: Processing BTS data from {bts_combined_file}...")
         df_bts = pd.read_parquet(bts_combined_file)
         if 'region' not in df_bts.columns:
@@ -389,6 +463,8 @@ def stage_merge(config: dict, validator: DataValidator, force: bool = False):
             merged_dfs.append(df_matched)
             
         del df_bts, df_matched
+    elif 'bts' not in merge_sources:
+        logger.info("  Merger: Skipping BTS because merge.schedule_sources excludes it.")
         
     if merged_dfs:
         df_merged = pd.concat(merged_dfs, ignore_index=True)
@@ -487,6 +563,37 @@ def stage_weather(config: dict, validator: DataValidator, force: bool = False):
     # ── Feature enrichment (Tasks 3.2, 3.3, 3.4, 2.3) ──
     from src.feature_enrichment import enrich_all
     df_weather_enriched = enrich_all(df_weather_enriched, df_weather)
+
+    enroute_cfg = config.get('enroute_weather', {}) if isinstance(config.get('enroute_weather', {}), dict) else {}
+    if bool(enroute_cfg.get('enabled', False)):
+        try:
+            from src.enroute_weather import EnrouteWeatherConfig, add_enroute_weather_features
+
+            sketches_file = Path(paths.get('trajectory_sketches_file', 'trajectory_sketches.parquet'))
+            if not sketches_file.is_absolute():
+                sketches_file = Path(paths['processed_data_dir']) / sketches_file
+            max_flights = enroute_cfg.get('max_flights')
+            max_flights = int(max_flights) if max_flights not in (None, '') else None
+
+            df_weather_enriched = add_enroute_weather_features(
+                df_weather_enriched,
+                sketches_path=sketches_file,
+                config=EnrouteWeatherConfig(
+                    enabled=True,
+                    provider=str(enroute_cfg.get('provider', 'open_meteo')),
+                    cache_dir=str(enroute_cfg.get('cache_dir', 'data/raw/enroute_weather_cache')),
+                    max_flights=max_flights,
+                    max_points_per_flight=int(enroute_cfg.get('max_points_per_flight', 24)),
+                    request_sleep_seconds=float(enroute_cfg.get('request_sleep_seconds', 0.05)),
+                    round_latlon_decimals=int(enroute_cfg.get('round_latlon_decimals', 2)),
+                    round_time=str(enroute_cfg.get('round_time', '1h')),
+                    timeout_seconds=int(enroute_cfg.get('timeout_seconds', 30)),
+                    force_refresh=bool(enroute_cfg.get('force_refresh', False)),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("En-route weather enrichment failed: %s", exc)
+
     traj_path = Path(paths['processed_data_dir']) / paths['trajectories_file']
     if traj_path.exists():
         try:
@@ -587,9 +694,19 @@ def stage_validate(config: dict, force: bool = False):
         else:
             df[col] = pd.NA
             final_cols.append(col)
+
+    # Optional, expensive feature families should be preserved when present but
+    # not created as all-null columns when their enrichment step is disabled.
+    optional_prefixes = ('enroute_',)
+    optional_cols = [
+        col for col in df.columns
+        if col not in final_cols and col.startswith(optional_prefixes)
+    ]
+    final_cols.extend(optional_cols)
     
     # Drop any extra columns
     extra_cols = [c for c in df.columns if c not in ML_DATASET_COLUMN_ORDER]
+    extra_cols = [c for c in extra_cols if c not in optional_cols]
     if extra_cols:
         logger.info(f"Dropping extra columns: {extra_cols}")
     

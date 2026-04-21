@@ -126,6 +126,31 @@ class ModelTrainer:
     def _balanced_sample_weight(y: pd.Series) -> np.ndarray:
         from sklearn.utils.class_weight import compute_sample_weight
         return compute_sample_weight(class_weight='balanced', y=np.asarray(y))
+
+    @staticmethod
+    def _prediction_to_label_vector(pred) -> np.ndarray:
+        """Normalize model predictions/probabilities into 1-D class labels.
+
+        Some GPU/runtime combinations return probability matrices from
+        ``predict`` for soft-probability objectives. Scikit-learn metrics need
+        class labels, so make that conversion in one place.
+        """
+        arr = np.asarray(pred)
+        if arr.ndim == 2:
+            if arr.shape[1] == 1:
+                arr = arr.ravel()
+            else:
+                return np.argmax(arr, axis=1)
+        elif arr.ndim > 2:
+            arr = np.squeeze(arr)
+            if arr.ndim > 1:
+                return np.argmax(arr, axis=-1).ravel()
+
+        if np.issubdtype(arr.dtype, np.floating):
+            finite = arr[np.isfinite(arr)]
+            if finite.size and finite.min() >= 0.0 and finite.max() <= 1.0:
+                return (arr >= 0.5).astype(int)
+        return arr
     
     def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
         """T17 + Task 5.1/5.2: Prepare data with class merging and temporal split.
@@ -168,7 +193,10 @@ class ModelTrainer:
         
         # Identify feature columns (exclude identifiers, targets, provenance)
         from src.schemas import ML_DROP_COLUMNS
-        drop_cols = ML_DROP_COLUMNS + ['label', 'delay_minutes']
+        configured_excludes = training_config.get('exclude_features', [])
+        drop_cols = ML_DROP_COLUMNS + ['label', 'delay_minutes'] + list(configured_excludes)
+        if configured_excludes:
+            logger.info("Excluding configured training features: %s", configured_excludes)
         
         feature_cols = [c for c in df_eligible.columns if c not in drop_cols]
         # Keep only numeric features
@@ -299,7 +327,7 @@ class ModelTrainer:
         )
         from sklearn.preprocessing import label_binarize
         
-        y_pred = model.predict(X_test)
+        y_pred = self._prediction_to_label_vector(model.predict(X_test))
         
         labels = self.label_encoder.classes_
         report = classification_report(y_pred=y_pred, y_true=y_test, 
@@ -431,7 +459,7 @@ class ModelTrainer:
                         {'eval_set': [(Xval, yval)], 'verbose': False, 'sample_weight': fold_sample_weight},
                         model_name='XGBoost CV'
                     )
-                    pred = clf.predict(Xval)
+                    pred = self._prediction_to_label_vector(clf.predict(Xval))
                     scores.append(f1_score(yval, pred, average='weighted', zero_division=0))
                 
                 return np.mean(scores)
@@ -524,7 +552,7 @@ class ModelTrainer:
                         {'eval_set': [(Xval, yval)], 'sample_weight': fold_sample_weight},
                         model_name='LightGBM CV'
                     )
-                    pred = clf.predict(Xval)
+                    pred = self._prediction_to_label_vector(clf.predict(Xval))
                     scores.append(f1_score(yval, pred, average='weighted', zero_division=0))
                 
                 return np.mean(scores)
@@ -601,41 +629,58 @@ class ModelTrainer:
     def train_all(self, X_train, X_test, y_train, y_test) -> Dict[str, Any]:
         """T19: Train all 4 models and return results dict."""
         results = {}
-        
+        training_config = self.config.get('training', {}) if isinstance(self.config.get('training', {}), dict) else {}
+        enabled_models = training_config.get(
+            'enabled_models',
+            ['logistic_regression', 'random_forest', 'xgboost', 'lightgbm', 'catboost'],
+        )
+        enabled_models = {str(model_name).lower() for model_name in enabled_models}
+        optuna_trials = int(training_config.get('optuna_trials', 10))
+        xgboost_trials = int(training_config.get('xgboost_trials', optuna_trials))
+        lightgbm_trials = int(training_config.get('lightgbm_trials', optuna_trials))
+
         # Baselines
-        lr = self.train_logistic_regression(X_train, y_train)
-        results['logistic_regression'] = {
-            'model': lr,
-            'metrics': self.evaluate(lr, X_test, y_test)
-        }
-        
-        rf = self.train_random_forest(X_train, y_train)
-        results['random_forest'] = {
-            'model': rf,
-            'metrics': self.evaluate(rf, X_test, y_test)
-        }
-        
-        # Boosted models with HPO
-        xgb_model = self.train_xgboost(X_train, X_test, y_train, y_test)
-        if xgb_model is not None:
-            results['xgboost'] = {
-                'model': xgb_model,
-                'metrics': self.evaluate(xgb_model, X_test, y_test)
-            }
-        
-        lgb_model = self.train_lightgbm(X_train, X_test, y_train, y_test)
-        if lgb_model is not None:
-            results['lightgbm'] = {
-                'model': lgb_model,
-                'metrics': self.evaluate(lgb_model, X_test, y_test)
+        if 'logistic_regression' in enabled_models:
+            lr = self.train_logistic_regression(X_train, y_train)
+            results['logistic_regression'] = {
+                'model': lr,
+                'metrics': self.evaluate(lr, X_test, y_test)
             }
 
-        cat_model = self.train_catboost(X_train, X_test, y_train, y_test)
-        if cat_model is not None:
-            results['catboost'] = {
-                'model': cat_model,
-                'metrics': self.evaluate(cat_model, X_test, y_test)
+        if 'random_forest' in enabled_models:
+            rf = self.train_random_forest(X_train, y_train)
+            results['random_forest'] = {
+                'model': rf,
+                'metrics': self.evaluate(rf, X_test, y_test)
             }
+        
+        # Boosted models with HPO
+        if 'xgboost' in enabled_models:
+            xgb_model = self.train_xgboost(X_train, X_test, y_train, y_test, n_trials=xgboost_trials)
+            if xgb_model is not None:
+                results['xgboost'] = {
+                    'model': xgb_model,
+                    'metrics': self.evaluate(xgb_model, X_test, y_test)
+                }
+        
+        if 'lightgbm' in enabled_models:
+            lgb_model = self.train_lightgbm(X_train, X_test, y_train, y_test, n_trials=lightgbm_trials)
+            if lgb_model is not None:
+                results['lightgbm'] = {
+                    'model': lgb_model,
+                    'metrics': self.evaluate(lgb_model, X_test, y_test)
+                }
+
+        if 'catboost' in enabled_models:
+            cat_model = self.train_catboost(X_train, X_test, y_train, y_test)
+            if cat_model is not None:
+                results['catboost'] = {
+                    'model': cat_model,
+                    'metrics': self.evaluate(cat_model, X_test, y_test)
+                }
+
+        if not results:
+            raise ValueError("No models were trained. Check training.enabled_models in config.")
         
         return results
     
@@ -859,7 +904,6 @@ class ModelTrainer:
             plt.close('all')
             
             # Force plots for top 3 most-delayed predictions
-            y_pred = best_model.predict(X_sample)
             sv = shap_matrix
             
             # Get indices with highest SHAP magnitude
