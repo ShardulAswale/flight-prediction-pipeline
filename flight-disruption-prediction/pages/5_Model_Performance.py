@@ -29,7 +29,7 @@ if ranking.empty:
 
 ranking.index = range(1, len(ranking) + 1)
 ranking.index.name = "rank"
-st.dataframe(ranking, use_container_width=True)
+st.dataframe(ranking, width="stretch")
 st.success(f"Best model: {comparison.get('best_model', 'N/A')}")
 
 st.divider()
@@ -40,7 +40,7 @@ if cm_files:
     for i, file_path in enumerate(cm_files):
         with cols[i % 2]:
             st.markdown(f"**{file_path.stem.replace('confusion_matrix_', '')}**")
-            st.image(str(file_path), use_container_width=True)
+            st.image(str(file_path), width="stretch")
 else:
     st.info("No confusion matrix images found.")
 
@@ -48,7 +48,7 @@ st.divider()
 st.subheader("ROC Curves")
 roc_path = Path("outputs/roc_curves.png")
 if roc_path.exists():
-    st.image(str(roc_path), use_container_width=True)
+    st.image(str(roc_path), width="stretch")
 else:
     st.info("ROC plot not available yet.")
 
@@ -98,7 +98,7 @@ try:
                     precision, recall, _ = precision_recall_curve(y_bin[:, i], y_score[:, i])
                     fig.add_trace(go.Scatter(x=recall, y=precision, mode="lines", name=str(class_name)))
                 fig.update_layout(title="Precision-Recall Curves", xaxis_title="Recall", yaxis_title="Precision")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.info("Selected model does not expose predict_proba.")
         else:
@@ -116,4 +116,4 @@ if ml_path.exists():
     if "label" in df.columns and not df.empty:
         dist = df["label"].value_counts()
         fig = px.pie(values=dist.values, names=dist.index, title="Actual Label Distribution")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")

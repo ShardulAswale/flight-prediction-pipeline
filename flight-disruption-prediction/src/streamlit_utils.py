@@ -1,9 +1,8 @@
 """FE1: Shared Streamlit utility functions."""
-import pandas as pd
 import json
-import os
 from pathlib import Path
-from functools import lru_cache
+
+import pandas as pd
 import streamlit as st
 
 
@@ -36,6 +35,90 @@ def load_dataset(name: str = 'ml_dataset') -> pd.DataFrame:
     if filepath.exists():
         return pd.read_parquet(filepath)
     return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def get_parquet_metadata(path: str | Path) -> dict:
+    path = Path(path)
+    if not path.exists():
+        return {"exists": False, "rows": 0, "columns": []}
+    try:
+        import pyarrow.parquet as pq
+
+        parquet_file = pq.ParquetFile(path)
+        return {
+            "exists": True,
+            "rows": int(parquet_file.metadata.num_rows),
+            "columns": parquet_file.schema.names,
+        }
+    except Exception:
+        return {"exists": True, "rows": 0, "columns": []}
+
+
+@st.cache_data(ttl=300)
+def read_parquet_limited(
+    path: str | Path,
+    columns: list[str] | None = None,
+    limit: int = 100_000,
+) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        import pyarrow.dataset as ds
+
+        dataset = ds.dataset(path, format="parquet")
+        selected_columns = columns or dataset.schema.names
+        selected_columns = [col for col in selected_columns if col in dataset.schema.names]
+        if not selected_columns:
+            selected_columns = dataset.schema.names
+        table = dataset.head(limit, columns=selected_columns)
+        return table.to_pandas()
+    except Exception:
+        try:
+            return pd.read_parquet(path, columns=columns).head(limit)
+        except Exception:
+            return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def read_parquet_filtered(
+    path: str | Path,
+    columns: list[str] | None = None,
+    filters: dict | None = None,
+    limit: int = 1000,
+) -> pd.DataFrame:
+    path = Path(path)
+    if not path.exists():
+        return pd.DataFrame()
+    filters = filters or {}
+    try:
+        import pyarrow.dataset as ds
+
+        dataset = ds.dataset(path, format="parquet")
+        selected_columns = columns or dataset.schema.names
+        selected_columns = [col for col in selected_columns if col in dataset.schema.names]
+        if not selected_columns:
+            selected_columns = dataset.schema.names
+
+        expression = None
+        for key, value in filters.items():
+            if key not in dataset.schema.names:
+                continue
+            term = ds.field(key) == value
+            expression = term if expression is None else expression & term
+
+        table = dataset.head(limit, columns=selected_columns, filter=expression)
+        return table.to_pandas()
+    except Exception:
+        try:
+            df = pd.read_parquet(path, columns=columns)
+            for key, value in filters.items():
+                if key in df.columns:
+                    df = df[df[key] == value]
+            return df.head(limit)
+        except Exception:
+            return pd.DataFrame()
 
 
 def load_model(name: str):

@@ -32,7 +32,7 @@ with tabs[0]:
     if numeric_cols:
         corr = df[numeric_cols].corr(method="pearson")
         fig = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("No numeric columns available.")
 
@@ -47,7 +47,7 @@ with tabs[1]:
         )
         top = imp_df.head(10)
         fig = px.bar(top.sort_values("importance"), x="importance", y="feature", orientation="h", title="Top 10 Features")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("Feature importance file not found yet.")
 
@@ -55,7 +55,7 @@ with tabs[2]:
     st.subheader("Feature Importance by Category")
     category_img = Path("outputs/feature_importance_by_category.png")
     if category_img.exists():
-        st.image(str(category_img), use_container_width=True)
+        st.image(str(category_img), width="stretch")
     else:
         st.info("Grouped category importance image not available yet.")
 
@@ -63,7 +63,7 @@ with tabs[3]:
     st.subheader("SHAP Summary")
     shap_img = Path("outputs/shap_summary.png")
     if shap_img.exists():
-        st.image(str(shap_img), use_container_width=True)
+        st.image(str(shap_img), width="stretch")
     else:
         st.info("SHAP summary image not available.")
 
@@ -79,7 +79,7 @@ with tabs[4]:
             mi = mutual_info_classif(X, y, random_state=42)
             mi_df = pd.DataFrame({"feature": numeric_cols, "mi_score": mi}).sort_values("mi_score", ascending=False)
             fig = px.bar(mi_df.head(20).sort_values("mi_score"), x="mi_score", y="feature", orientation="h", title="Top MI Features")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         except Exception as e:
             st.info(f"MI computation unavailable: {e}")
     else:
@@ -101,7 +101,7 @@ with tabs[5]:
             "coverage_pct": [round(float(df[c].notna().mean() * 100), 2) for c in deviation_cols],
         })
         fig_cov = px.bar(coverage, x="feature", y="coverage_pct", title="Route Deviation Coverage %")
-        st.plotly_chart(fig_cov, use_container_width=True)
+        st.plotly_chart(fig_cov, width="stretch")
 
         selected_dev = st.selectbox("Deviation feature", deviation_cols, key="route_dev_feature")
         plot_df = df[[selected_dev] + (["label"] if "label" in df.columns else [])].copy()
@@ -109,7 +109,7 @@ with tabs[5]:
             fig = px.histogram(plot_df, x=selected_dev, color="label", barmode="overlay", opacity=0.65)
         else:
             fig = px.histogram(plot_df, x=selected_dev)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("No route deviation columns available in the ML dataset.")
 
@@ -124,4 +124,4 @@ with tabs[6]:
                 fig = px.histogram(df, x=feat, color="label", barmode="overlay", opacity=0.6)
             else:
                 fig = px.histogram(df, x=feat)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")

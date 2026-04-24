@@ -202,6 +202,75 @@ def save_bar_chart(
     return path
 
 
+def _format_size(size_mb: float) -> str:
+    if pd.isna(size_mb):
+        return ""
+    if size_mb >= 1024:
+        return f"{size_mb / 1024:.2f} GB"
+    return f"{size_mb:.2f} MB"
+
+
+def save_dataset_size_charts(inventory: pd.DataFrame, out_dir: str | Path) -> dict[str, Path]:
+    """Save readable dataset-size charts for sources with very different scales."""
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    chart_df = inventory[inventory["exists"]].copy()
+    chart_df["size_mb"] = pd.to_numeric(chart_df["size_mb"], errors="coerce").fillna(0)
+    chart_df = chart_df.sort_values("size_mb", ascending=False)
+
+    paths: dict[str, Path] = {}
+    if chart_df.empty:
+        return paths
+
+    size_table = chart_df[["dataset", "size_mb", "rows", "columns"]].copy()
+    size_table["size"] = size_table["size_mb"].map(_format_size)
+    size_table = size_table[["dataset", "size", "size_mb", "rows", "columns"]]
+    save_dataframe(size_table, "dataset_sizes_table", out)
+    paths["table"] = save_table_image(
+        size_table,
+        "dataset_sizes_table",
+        out,
+        title="Dataset Sizes",
+        max_rows=30,
+        max_cols=5,
+    )
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.bar(chart_df["dataset"].astype(str), chart_df["size_mb"], color="#3A7D44")
+    ax.set_yscale("log")
+    ax.set_xlabel("Dataset")
+    ax.set_ylabel("Size (MB, log scale)")
+    ax.set_title("Dataset Size by Source (Log Scale)", fontsize=15, weight="bold")
+    ax.tick_params(axis="x", rotation=35)
+    ax.grid(axis="y", alpha=0.25)
+    for idx, (_, row) in enumerate(chart_df.iterrows()):
+        ax.text(idx, max(float(row["size_mb"]), 1.0), _format_size(float(row["size_mb"])), ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    paths["log"] = out / "dataset_sizes_log.png"
+    fig.savefig(paths["log"], dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    processed_df = chart_df[~chart_df["dataset"].astype(str).eq("adsb_combined")].copy()
+    if not processed_df.empty:
+        fig, ax = plt.subplots(figsize=(11, 6))
+        ax.bar(processed_df["dataset"].astype(str), processed_df["size_mb"], color="#2D6A8E")
+        ax.set_xlabel("Dataset")
+        ax.set_ylabel("Size (MB)")
+        ax.set_title("Processed Dataset Sizes (ADS-B Excluded)", fontsize=15, weight="bold")
+        ax.tick_params(axis="x", rotation=35)
+        ax.grid(axis="y", alpha=0.25)
+        for idx, (_, row) in enumerate(processed_df.iterrows()):
+            ax.text(idx, float(row["size_mb"]), _format_size(float(row["size_mb"])), ha="center", va="bottom", fontsize=8)
+        fig.tight_layout()
+        paths["processed_only"] = out / "dataset_sizes_processed_only.png"
+        fig.savefig(paths["processed_only"], dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+    return paths
+
+
 def save_missingness_chart(df: pd.DataFrame, stem: str, out_dir: str | Path, *, top_n: int = 30) -> Path:
     missing = (
         df.isna()
@@ -294,6 +363,7 @@ def save_dataset_inventory(paths: Mapping[str, str | Path], out_dir: str | Path)
             ylabel="Size (MB)",
             color="#3A7D44",
         )
+        save_dataset_size_charts(inv, out_dir)
     return inv
 
 

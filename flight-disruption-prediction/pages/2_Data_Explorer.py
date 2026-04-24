@@ -1,4 +1,4 @@
-"""FE3: Data Explorer - interactive browser for all core datasets."""
+"""Data Explorer - lightweight interactive browser for core datasets."""
 import os
 import sys
 from pathlib import Path
@@ -7,41 +7,51 @@ import pandas as pd
 import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from src.streamlit_utils import get_parquet_metadata, read_parquet_limited
 
-st.set_page_config(page_title="Data Explorer", page_icon="🔍", layout="wide")
-st.markdown("# 🔍 Data Explorer")
+st.set_page_config(page_title="Data Explorer", page_icon="??", layout="wide")
+st.markdown("# ?? Data Explorer")
+
+PATH_MAP = {
+    "ADS-B Combined": Path("data/processed/adsb_combined.parquet"),
+    "BTS Schedules": Path("data/processed/bts_combined.parquet"),
+    "Eurocontrol Schedules": Path("data/processed/eurocontrol_combined.parquet"),
+    "Merged": Path("data/processed/ml_dataset_merged.parquet"),
+    "ML Dataset": Path("data/processed/ml_dataset.parquet"),
+}
+DEFAULT_COLUMNS = {
+    "ADS-B Combined": ["icao24", "callsign", "timestamp", "latitude", "longitude", "baro_altitude", "velocity", "on_ground"],
+    "BTS Schedules": ["flight_key", "scheduled_dep", "origin", "destination", "cancelled", "dep_delay_minutes"],
+    "Eurocontrol Schedules": ["flight_key", "scheduled_dep", "origin", "destination", "callsign"],
+    "Merged": ["flight_key", "scheduled_dep", "origin", "destination", "label", "trajectory_quality_status"],
+    "ML Dataset": ["flight_key", "scheduled_dep", "origin", "destination", "label", "delay_minutes", "trajectory_quality_score"],
+}
+
+def load_preview(choice: str, limit: int) -> tuple[pd.DataFrame, dict]:
+    data_path = PATH_MAP[choice]
+    meta = get_parquet_metadata(data_path)
+    if not meta.get("exists"):
+        return pd.DataFrame(), meta
+    cols = [c for c in DEFAULT_COLUMNS.get(choice, []) if c in meta.get("columns", [])]
+    if not cols:
+        cols = meta.get("columns", [])[:12]
+    df = read_parquet_limited(data_path, columns=cols, limit=limit)
+    return df, meta
 
 
-def _read_dataset(choice: str) -> pd.DataFrame:
-    path_map = {
-        "ADS-B Combined": Path("data/processed/adsb_combined.parquet"),
-        "BTS Schedules": Path("data/processed/bts_combined.parquet"),
-        "Eurocontrol Schedules": Path("data/processed/eurocontrol_combined.parquet"),
-        "Merged": Path("data/processed/ml_dataset_merged.parquet"),
-        "ML Dataset": Path("data/processed/ml_dataset.parquet"),
-    }
-    data_path = path_map[choice]
-    if not data_path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(data_path)
-
-
-dataset_choice = st.sidebar.selectbox(
-    "Dataset",
-    ["ADS-B Combined", "BTS Schedules", "Eurocontrol Schedules", "Merged", "ML Dataset"],
-)
-df = _read_dataset(dataset_choice)
+dataset_choice = st.sidebar.selectbox("Dataset", list(PATH_MAP.keys()))
+preview_limit = st.sidebar.slider("Preview rows", min_value=1000, max_value=100000, value=20000, step=1000)
+df, meta = load_preview(dataset_choice, preview_limit)
 
 if df.empty:
     st.warning(f"{dataset_choice} is not available yet.")
     st.stop()
 
-if len(df) > 1_000_000:
-    st.info("Large dataset detected (>1M rows). Showing a 1,000,000-row sample for responsiveness.")
-    df = df.sample(1_000_000, random_state=42)
+st.sidebar.markdown(f"**Total rows:** {meta.get('rows', 0):,}")
+st.sidebar.markdown(f"**Preview rows:** {len(df):,}")
+st.sidebar.markdown(f"**Columns in file:** {len(meta.get('columns', []))}")
 
-st.sidebar.markdown(f"**Rows:** {len(df):,}")
-st.sidebar.markdown(f"**Columns:** {len(df.columns)}")
+st.info("This page uses a limited preview, not a full parquet load, to keep the app responsive.")
 
 time_col = next((c for c in ["scheduled_dep", "timestamp", "date"] if c in df.columns), None)
 airport_col = next((c for c in ["origin", "origin_airport", "airport_code", "ORIGIN"] if c in df.columns), None)
@@ -63,7 +73,7 @@ if time_col is not None:
 
 if airport_col is not None:
     airports = sorted(filtered[airport_col].dropna().astype(str).unique().tolist())
-    selected_airports = st.sidebar.multiselect("Airports", airports[:500])
+    selected_airports = st.sidebar.multiselect("Airports", airports[:200])
     if selected_airports:
         filtered = filtered[filtered[airport_col].astype(str).isin(selected_airports)]
 
@@ -72,17 +82,17 @@ if callsign_col is not None:
     if callsign_query.strip():
         filtered = filtered[filtered[callsign_col].astype(str).str.contains(callsign_query.strip(), case=False, na=False)]
 
-st.markdown(f"**Showing {len(filtered):,} rows** after filters")
+st.markdown(f"**Showing {len(filtered):,} preview rows** after filters")
 
 all_cols = filtered.columns.tolist()
 default_cols = all_cols[: min(15, len(all_cols))]
 selected_cols = st.multiselect("Columns to display", all_cols, default=default_cols)
 show_df = filtered[selected_cols] if selected_cols else filtered
-st.dataframe(show_df.head(100), use_container_width=True, height=520)
+st.dataframe(show_df.head(100), width="stretch", height=520, hide_index=True)
 
 st.divider()
 stats_col1, stats_col2, stats_col3 = st.columns(3)
-stats_col1.metric("Row Count", f"{len(filtered):,}")
+stats_col1.metric("Preview Row Count", f"{len(filtered):,}")
 stats_col2.metric("Null Cells", f"{int(filtered.isna().sum().sum()):,}")
 stats_col3.metric("Column Count", f"{len(filtered.columns)}")
 
@@ -94,7 +104,12 @@ with st.expander("Column Types & Null Percent", expanded=False):
             "null_pct": (filtered.isna().mean() * 100).round(2).values,
         }
     ).sort_values("null_pct", ascending=False)
-    st.dataframe(info_df, use_container_width=True)
+    st.dataframe(info_df, width="stretch", hide_index=True)
 
 csv_bytes = filtered.to_csv(index=False).encode("utf-8")
-st.download_button("Download Filtered CSV", csv_bytes, file_name=f"{dataset_choice.lower().replace(' ', '_')}_filtered.csv", mime="text/csv")
+st.download_button(
+    "Download Preview CSV",
+    csv_bytes,
+    file_name=f"{dataset_choice.lower().replace(' ', '_')}_preview.csv",
+    mime="text/csv",
+)

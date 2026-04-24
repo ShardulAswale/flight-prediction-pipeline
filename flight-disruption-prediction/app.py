@@ -7,6 +7,7 @@ import os
 import sys
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+from src.streamlit_utils import get_parquet_metadata, read_parquet_limited
 
 st.set_page_config(
     page_title="Flight Disruption Prediction",
@@ -47,10 +48,14 @@ try:
     
     ml_path = os.path.join(data_dir, config['paths']['ml_dataset_file'])
     if os.path.exists(ml_path):
-        df = pd.read_parquet(ml_path)
-        col1.metric("Total Flights", f"{len(df):,}")
+        meta = get_parquet_metadata(ml_path)
+        sample_cols = [c for c in ["label", "region", "source_dataset"] if c in meta.get("columns", [])]
+        df = read_parquet_limited(ml_path, columns=sample_cols, limit=200_000)
+        col1.metric("Total Flights", f"{meta.get('rows', 0):,}")
         if 'label' in df.columns:
-            col2.metric("Disrupted", f"{(df['label'] != 'Normal').sum():,}")
+            disrupted = int((df['label'] != 'Normal').sum())
+            label = f"{disrupted:,}" if meta.get('rows', 0) <= len(df) else f"{disrupted:,} (sample)"
+            col2.metric("Disrupted", label)
         if 'region' in df.columns:
             col3.metric("Regions", df['region'].nunique())
         if 'source_dataset' in df.columns:

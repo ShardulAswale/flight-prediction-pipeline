@@ -43,7 +43,7 @@ if not df.empty and "scheduled_dep" in df.columns:
     heat_df = pd.DataFrame(rows)
     if not heat_df.empty:
         fig = px.density_heatmap(heat_df, x="month", y="column", z="null_pct", color_continuous_scale="YlOrRd")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 else:
     st.info("Need non-empty ML dataset with scheduled_dep to compute monthly missingness.")
 
@@ -57,7 +57,7 @@ if weather_cov_path.exists():
         [{"feature": k, "coverage_pct": v.get("coverage_pct", 0), "null_pct": v.get("null_pct", 100)} for k, v in cov.items()]
     )
     fig = px.bar(cov_df, x="feature", y="coverage_pct", title="Weather Feature Coverage %")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 else:
     st.info("No weather coverage report found.")
 
@@ -75,10 +75,10 @@ if drift_path.exists():
         trend = drift[drift["feature"].astype(str) == feat].sort_values("month")
         fig = px.line(trend, x="month", y="psi", markers=True, title=f"PSI Trend - {feat}")
         fig.add_hline(y=0.2, line_dash="dash", line_color="red", annotation_text="Alert threshold 0.2")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     heatmap_path = Path("outputs/drift_heatmap.png")
     if heatmap_path.exists():
-        st.image(str(heatmap_path), use_container_width=True)
+        st.image(str(heatmap_path), width="stretch")
 else:
     st.info("No drift report found. Run `python main.py --stage drift`.")
 
