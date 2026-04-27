@@ -1,0 +1,11 @@
+# Generated experiment and report artifacts
+outputs/
+important outputs/
+weighted_*_run/
+
+# Runtime / cache artifacts
+logs/
+__pycache__/
+.pytest_cache/
+.pytest_tmp/
+.pytest_tmp_run/

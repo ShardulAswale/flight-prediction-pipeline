@@ -99,6 +99,22 @@ validation_mode: warn_only
 
 training:
   use_gpu: True
+  target_mode: "binary_disrupted"
+  cancelled_merge_threshold: 200
+  subtype_sample_weights:
+    enabled: true
+    # T11: Unweighted: same as binary classification baseline
+    normal: 1.0
+    late: 1.0
+    cancelled: 1.0
+    # T11: Weighted by disruption delay thresholds
+    # normal: 1.0
+    # late: 2.0
+    # cancelled: 5.0
+    # T11: Weighted by disruption delay thresholds
+    # normal: 1.0
+    # late: 2.0
+    # cancelled: 10.0
   # Keep first-pass training fast and reproducible. LightGBM/CatBoost can be
   # re-enabled for a final benchmark once the feature set is locked.
   enabled_models: ["logistic_regression", "random_forest", "xgboost"]

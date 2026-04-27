@@ -38,6 +38,10 @@ class ModelTrainer:
         self.label_encoder = None
         self.feature_names = None
         self.correlation_dropped_features = []
+        self.train_sample_weight = None
+        self.test_sample_weight = None
+        self.target_label_column = 'label'
+        self.subtype_weight_config = {}
 
     def _gpu_status_message(self) -> str:
         return 'enabled' if self.use_gpu else 'disabled'
@@ -127,6 +131,86 @@ class ModelTrainer:
         from sklearn.utils.class_weight import compute_sample_weight
         return compute_sample_weight(class_weight='balanced', y=np.asarray(y))
 
+    def _get_training_config(self) -> dict:
+        return self.config.get('training', {}) if isinstance(self.config.get('training', {}), dict) else {}
+
+    def _target_mode(self) -> str:
+        return str(self._get_training_config().get('target_mode', 'binary_disrupted')).strip().lower()
+
+    def _subtype_weight_config(self) -> dict:
+        subtype_cfg = self._get_training_config().get('subtype_sample_weights', {})
+        if not isinstance(subtype_cfg, dict):
+            subtype_cfg = {}
+        return {
+            'enabled': bool(subtype_cfg.get('enabled', False)),
+            'normal': float(subtype_cfg.get('normal', 1.0)),
+            'late': float(subtype_cfg.get('late', 1.0)),
+            'cancelled': float(subtype_cfg.get('cancelled', 1.0)),
+        }
+
+    def _ensure_training_label_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if 'label_original' not in out.columns:
+            out['label_original'] = out.get('label', 'Normal')
+        if 'label_binary' not in out.columns:
+            out['label_binary'] = np.where(
+                out['label_original'].isin(['Late', 'Cancelled']),
+                'Disrupted',
+                out['label_original'],
+            )
+        if 'disruption_subtype' not in out.columns:
+            out['disruption_subtype'] = np.where(
+                out['label_original'] == 'Cancelled',
+                'Cancelled',
+                np.where(
+                    out['label_original'] == 'Late',
+                    'Late',
+                    out['label_original'],
+                ),
+            )
+        return out
+
+    def _prepare_target_labels(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = self._ensure_training_label_columns(df)
+        target_mode = self._target_mode()
+
+        if target_mode == 'binary_disrupted':
+            self.target_label_column = 'label_binary'
+            return out
+
+        self.target_label_column = 'label'
+        cancelled_count = (out['label'] == 'Cancelled').sum()
+        cancelled_merge_threshold = int(self._get_training_config().get('cancelled_merge_threshold', 200))
+        if cancelled_count > 0 and cancelled_count < cancelled_merge_threshold:
+            logger.info(
+                "Merging %d Cancelled rows into Late (threshold=%d)",
+                cancelled_count,
+                cancelled_merge_threshold,
+            )
+            out.loc[out['label'] == 'Cancelled', 'label'] = 'Late'
+        return out
+
+    def _subtype_multiplier(self, subtype: pd.Series) -> pd.Series:
+        subtype_cfg = self._subtype_weight_config()
+        self.subtype_weight_config = subtype_cfg
+        if not subtype_cfg.get('enabled', False):
+            return pd.Series(1.0, index=subtype.index, dtype='float64')
+
+        multiplier_map = {
+            'Normal': subtype_cfg['normal'],
+            'Late': subtype_cfg['late'],
+            'Cancelled': subtype_cfg['cancelled'],
+            'Disrupted': subtype_cfg['late'],
+            'Unverified': 1.0,
+        }
+        return subtype.map(multiplier_map).fillna(1.0).astype('float64')
+
+    def _compose_training_sample_weight(self, y: pd.Series, subtype_multiplier: Optional[pd.Series] = None) -> pd.Series:
+        balanced = pd.Series(self._balanced_sample_weight(y), index=y.index, dtype='float64')
+        if subtype_multiplier is None:
+            return balanced
+        return balanced.mul(subtype_multiplier.reindex(y.index).fillna(1.0).astype('float64'))
+
     @staticmethod
     def _prediction_to_label_vector(pred) -> np.ndarray:
         """Normalize model predictions/probabilities into 1-D class labels.
@@ -153,62 +237,45 @@ class ModelTrainer:
         return arr
     
     def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        """T17 + Task 5.1/5.2: Prepare data with class merging and temporal split.
-        
-        Changes:
-        - Task 5.1: Merge 'Cancelled' into 'Late' (too few samples for own class)
-        - Task 5.2: Temporal train/test split instead of random
-        
-        Returns:
-            (X_train, X_test, y_train, y_test)
-        """
+        """Prepare features/targets and persist training sample weights on the trainer instance."""
         from sklearn.impute import SimpleImputer
-        from sklearn.preprocessing import StandardScaler, LabelEncoder
-        training_config = self.config.get('training', {}) if isinstance(self.config.get('training', {}), dict) else {}
-        
-        logger.info(f"Preparing data from {len(df)} rows...")
-        
-        # Filter to training-eligible rows
+        from sklearn.model_selection import train_test_split
+        from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+        training_config = self._get_training_config()
+
+        logger.info("Preparing data from %d rows...", len(df))
+
         if 'training_eligible' in df.columns:
             df_eligible = df[df['training_eligible'] == True].copy()
-            logger.info(f"Filtered to {len(df_eligible)} training-eligible rows")
+            logger.info("Filtered to %d training-eligible rows", len(df_eligible))
         else:
             df_eligible = df.copy()
-            logger.info("No training_eligible column — using all rows")
-        
+            logger.info("No training_eligible column; using all rows")
+
         if df_eligible.empty or 'label' not in df_eligible.columns:
             raise ValueError("No training data available or 'label' column missing")
-        
-        # Task 5.1: Merge Cancelled into Late (too few samples for separate class)
-        cancelled_count = (df_eligible['label'] == 'Cancelled').sum()
-        if cancelled_count > 0 and cancelled_count < 200:
-            logger.info(
-                "Merging %d Cancelled rows into Late (too few for separate class)",
-                cancelled_count,
-            )
-            df_eligible.loc[df_eligible['label'] == 'Cancelled', 'label'] = 'Late'
-        
-        # Drop rows with label = Unverified (should already be stripped)
+
         df_eligible = df_eligible[df_eligible['label'] != 'Unverified'].copy()
-        
-        # Identify feature columns (exclude identifiers, targets, provenance)
+        df_eligible = self._prepare_target_labels(df_eligible)
+        logger.info("Training target mode: %s (label column: %s)", self._target_mode(), self.target_label_column)
+
         from src.schemas import ML_DROP_COLUMNS
+
         configured_excludes = training_config.get('exclude_features', [])
         drop_cols = ML_DROP_COLUMNS + ['label', 'delay_minutes'] + list(configured_excludes)
         if configured_excludes:
             logger.info("Excluding configured training features: %s", configured_excludes)
-        
+
         feature_cols = [c for c in df_eligible.columns if c not in drop_cols]
-        # Keep only numeric features
         numeric_features = df_eligible[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
-        
-        # Handle boolean columns
+
         bool_cols = df_eligible[feature_cols].select_dtypes(include=['bool']).columns.tolist()
         for col in bool_cols:
             df_eligible[col] = df_eligible[col].astype(int)
             if col not in numeric_features:
                 numeric_features.append(col)
-        
+
         X = df_eligible[numeric_features].copy()
 
         all_null_numeric = [col for col in numeric_features if X[col].isna().all()]
@@ -238,16 +305,16 @@ class ModelTrainer:
         self.correlation_dropped_features = corr_drop_cols
 
         self.feature_names = numeric_features
-        logger.info(f"Using {len(numeric_features)} numeric features: {numeric_features}")
-        y = df_eligible['label'].copy()
-        
-        # Encode labels
+        logger.info("Using %d numeric features", len(numeric_features))
+
+        y = df_eligible[self.target_label_column].copy()
+        subtype_multiplier = self._subtype_multiplier(df_eligible['disruption_subtype'])
+
         self.label_encoder = LabelEncoder()
         y_encoded = pd.Series(self.label_encoder.fit_transform(y), index=y.index)
         if y_encoded.nunique() < 2:
             raise ValueError("Training requires at least 2 label classes. Current dataset has one class.")
-        
-        # Task 5.2: Temporal split by scheduled_dep date instead of random
+
         if 'scheduled_dep' in df_eligible.columns:
             dep_dates = pd.to_datetime(df_eligible['scheduled_dep'], utc=True, errors='coerce').dt.normalize()
             unique_days = sorted(dep_dates.dropna().unique())
@@ -261,63 +328,85 @@ class ModelTrainer:
                 train_mask = dep_dates <= cutoff_date
                 test_mask = dep_dates > cutoff_date
                 logger.info("Temporal split fallback using 0.8 quantile cutoff %s.", cutoff_date)
-            
+
             if test_mask.sum() > 0 and train_mask.sum() > 0:
                 X_train = X.loc[train_mask]
                 X_test = X.loc[test_mask]
                 y_train = y_encoded.loc[train_mask]
                 y_test = y_encoded.loc[test_mask]
+                subtype_multiplier_train = subtype_multiplier.loc[train_mask]
+                subtype_multiplier_test = subtype_multiplier.loc[test_mask]
                 logger.info("Temporal split sizes: train=%d, test=%d", len(X_train), len(X_test))
             else:
-                logger.warning("Temporal split produced empty set — falling back to random")
-                from sklearn.model_selection import train_test_split
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y_encoded, test_size=0.2, random_state=self.seed, stratify=y_encoded
+                logger.warning("Temporal split produced empty set; falling back to random split.")
+                X_train, X_test, subtype_multiplier_train, subtype_multiplier_test, y_train, y_test = train_test_split(
+                    X,
+                    subtype_multiplier,
+                    y_encoded,
+                    test_size=0.2,
+                    random_state=self.seed,
+                    stratify=y_encoded,
                 )
         else:
-            from sklearn.model_selection import train_test_split
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y_encoded, test_size=0.2, random_state=self.seed, stratify=y_encoded
+            X_train, X_test, subtype_multiplier_train, subtype_multiplier_test, y_train, y_test = train_test_split(
+                X,
+                subtype_multiplier,
+                y_encoded,
+                test_size=0.2,
+                random_state=self.seed,
+                stratify=y_encoded,
             )
-        
-        # Imputation
+
         self.imputer = SimpleImputer(strategy='median', keep_empty_features=True)
         X_train_imp = pd.DataFrame(
-            self.imputer.fit_transform(X_train), 
-            columns=numeric_features, index=X_train.index
+            self.imputer.fit_transform(X_train),
+            columns=numeric_features,
+            index=X_train.index,
         )
         X_test_imp = pd.DataFrame(
             self.imputer.transform(X_test),
-            columns=numeric_features, index=X_test.index
+            columns=numeric_features,
+            index=X_test.index,
         )
-        
-        # Scaling
+
         self.scaler = StandardScaler()
         X_train_scaled = pd.DataFrame(
             self.scaler.fit_transform(X_train_imp),
-            columns=numeric_features, index=X_train.index
+            columns=numeric_features,
+            index=X_train.index,
         )
         X_test_scaled = pd.DataFrame(
             self.scaler.transform(X_test_imp),
-            columns=numeric_features, index=X_test.index
+            columns=numeric_features,
+            index=X_test.index,
         )
-        
-        logger.info(f"Data prep complete: Train={X_train_scaled.shape}, Test={X_test_scaled.shape}")
-        logger.info(f"Label distribution (train): {dict(pd.Series(self.label_encoder.inverse_transform(y_train)).value_counts())}")
 
-        # Persist preprocessing artifacts for downstream inference/UI use.
+        self.train_sample_weight = self._compose_training_sample_weight(y_train, subtype_multiplier_train)
+        self.test_sample_weight = self._compose_training_sample_weight(y_test, subtype_multiplier_test)
+
+        logger.info("Data prep complete: Train=%s, Test=%s", X_train_scaled.shape, X_test_scaled.shape)
+        logger.info("Label distribution (train): %s", dict(pd.Series(self.label_encoder.inverse_transform(y_train)).value_counts()))
+        if self.subtype_weight_config.get('enabled'):
+            logger.info(
+                "Subtype weighting enabled: normal=%.2f late=%.2f cancelled=%.2f",
+                self.subtype_weight_config['normal'],
+                self.subtype_weight_config['late'],
+                self.subtype_weight_config['cancelled'],
+            )
+
         try:
             import joblib
+
             joblib.dump(self.scaler, self.models_dir / 'scaler.pkl')
             joblib.dump(self.imputer, self.models_dir / 'imputer.pkl')
             joblib.dump(self.label_encoder, self.models_dir / 'label_encoder.pkl')
             with open(self.models_dir / 'feature_list.json', 'w') as f:
                 json.dump(self.feature_names, f, indent=2)
         except Exception as e:
-            logger.warning(f"Failed to persist preprocessing artifacts: {e}")
-        
+            logger.warning("Failed to persist preprocessing artifacts: %s", e)
+
         return X_train_scaled, X_test_scaled, y_train, y_test
-    
+
     def evaluate(self, model, X_test: pd.DataFrame, y_test: pd.Series) -> dict:
         """Task 5.3: Evaluate with enhanced metrics — F1-macro, Cohen's Kappa, per-class recall."""
         from sklearn.metrics import (
@@ -378,30 +467,38 @@ class ModelTrainer:
         logger.info(f"Model saved to {path}")
     
     def train_logistic_regression(self, X_train, y_train):
-        """T18 + Task 5.1: Logistic Regression with balanced class weights."""
+        """Train Logistic Regression with persisted sample weights."""
         from sklearn.linear_model import LogisticRegression
         
-        logger.info("Training Logistic Regression (class_weight=balanced)...")
+        logger.info("Training Logistic Regression with sample weights=%s...", self.train_sample_weight is not None)
         model = LogisticRegression(
             max_iter=1000,
             random_state=self.seed,
             solver='lbfgs',
-            class_weight='balanced',
         )
-        model.fit(X_train, y_train)
+        fit_kwargs = {}
+        if self.train_sample_weight is not None:
+            fit_kwargs['sample_weight'] = np.asarray(self.train_sample_weight)
+        else:
+            model.set_params(class_weight='balanced')
+        model.fit(X_train, y_train, **fit_kwargs)
         self.save_model(model, 'logistic_regression')
         return model
     
     def train_random_forest(self, X_train, y_train):
-        """T18 + Task 5.1: Random Forest with balanced class weights."""
+        """Train Random Forest with persisted sample weights."""
         from sklearn.ensemble import RandomForestClassifier
         
-        logger.info("Training Random Forest (class_weight=balanced, GPU %s)...", self._gpu_status_message())
+        logger.info("Training Random Forest (sample weights=%s, GPU %s)...", self.train_sample_weight is not None, self._gpu_status_message())
         model = RandomForestClassifier(
             n_estimators=200, random_state=self.seed, n_jobs=-1,
-            class_weight='balanced',
         )
-        model.fit(X_train, y_train)
+        fit_kwargs = {}
+        if self.train_sample_weight is not None:
+            fit_kwargs['sample_weight'] = np.asarray(self.train_sample_weight)
+        else:
+            model.set_params(class_weight='balanced')
+        model.fit(X_train, y_train, **fit_kwargs)
         self.save_model(model, 'random_forest')
         return model
     
@@ -418,7 +515,7 @@ class ModelTrainer:
             logger.info(f"Training XGBoost with {n_trials} Optuna trials (GPU {self._gpu_status_message()})...")
             
             num_classes = len(np.unique(y_train))
-            sample_weight_train = self._balanced_sample_weight(y_train)
+            sample_weight_train = np.asarray(self.train_sample_weight) if self.train_sample_weight is not None else self._balanced_sample_weight(y_train)
             
             def objective(trial):
                 params = {
@@ -451,7 +548,10 @@ class ModelTrainer:
                         runtime_params = {'tree_method': 'hist'} if not use_gpu_runtime else {'tree_method': 'hist', 'device': 'cuda'}
                         return xgb.XGBClassifier(**{**params, **runtime_params})
 
-                    fold_sample_weight = self._balanced_sample_weight(ytr)
+                    if self.train_sample_weight is not None:
+                        fold_sample_weight = np.asarray(pd.Series(self.train_sample_weight, index=y_train.index).loc[ytr.index])
+                    else:
+                        fold_sample_weight = self._balanced_sample_weight(ytr)
 
                     clf = self._fit_with_gpu_fallback(
                         build_xgb,
@@ -512,7 +612,7 @@ class ModelTrainer:
             logger.info(f"Training LightGBM with {n_trials} Optuna trials (GPU {self._gpu_status_message()})...")
             
             num_classes = len(np.unique(y_train))
-            sample_weight_train = self._balanced_sample_weight(y_train)
+            sample_weight_train = np.asarray(self.train_sample_weight) if self.train_sample_weight is not None else self._balanced_sample_weight(y_train)
             
             def objective(trial):
                 params = {
@@ -544,7 +644,10 @@ class ModelTrainer:
                         runtime_params = {'device_type': 'cpu'} if not use_gpu_runtime else {'device_type': 'gpu'}
                         return lgb.LGBMClassifier(**{**params, **runtime_params})
 
-                    fold_sample_weight = self._balanced_sample_weight(ytr)
+                    if self.train_sample_weight is not None:
+                        fold_sample_weight = np.asarray(pd.Series(self.train_sample_weight, index=y_train.index).loc[ytr.index])
+                    else:
+                        fold_sample_weight = self._balanced_sample_weight(ytr)
 
                     clf = self._fit_with_gpu_fallback(
                         build_lgbm,
@@ -612,7 +715,7 @@ class ModelTrainer:
                 runtime_params = {'task_type': 'CPU'} if not use_gpu_runtime else {'task_type': 'GPU'}
                 return CatBoostClassifier(**{**base_params, **runtime_params})
 
-            sample_weight_train = self._balanced_sample_weight(y_train)
+            sample_weight_train = np.asarray(self.train_sample_weight) if self.train_sample_weight is not None else self._balanced_sample_weight(y_train)
 
             model = self._fit_with_gpu_fallback(
                 build_catboost,
@@ -935,3 +1038,4 @@ class ModelTrainer:
             logger.warning("SHAP not installed. Install via: pip install shap")
         except Exception as e:
             logger.warning(f"SHAP explanation failed: {e}")
+

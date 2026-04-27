@@ -92,6 +92,21 @@ class LabelGenerator:
         if "cancelled" not in df.columns:
             df["cancelled"] = cancelled_mask.astype("int64")
         df["label"] = df["label"].fillna("Normal")
+        df["label_original"] = df["label"]
+        df["label_binary"] = np.where(
+            df["label"].isin(["Late", "Cancelled"]),
+            "Disrupted",
+            df["label"],
+        )
+        df["disruption_subtype"] = np.where(
+            df["label"] == "Cancelled",
+            "Cancelled",
+            np.where(
+                df["label"] == "Late",
+                "Late",
+                df["label"],
+            ),
+        )
 
         try:
             dist = df["label"].value_counts()

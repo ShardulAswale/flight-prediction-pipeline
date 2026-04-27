@@ -195,6 +195,9 @@ ML_DATASET_SCHEMA = {
     # Target
     'delay_minutes':           {'dtype': 'float64',  'max_null_pct': 0.30, 'is_utc': False},
     'label':                   {'dtype': 'object',   'max_null_pct': 0.0,  'is_utc': False},
+    'label_original':          {'dtype': 'object',   'max_null_pct': 0.0,  'is_utc': False},
+    'label_binary':            {'dtype': 'object',   'max_null_pct': 0.0,  'is_utc': False},
+    'disruption_subtype':      {'dtype': 'object',   'max_null_pct': 0.0,  'is_utc': False},
 }
 
 # ── Column Order for Final Export (T16) ──────────────────────────────────
@@ -235,7 +238,7 @@ ML_DATASET_COLUMN_ORDER = [
     'match_quality', 'label_source', 'match_score_minutes', 'match_anchor', 'match_confidence',
     'training_eligible', 'feature_quality_score',
     # Target
-    'delay_minutes', 'label',
+    'delay_minutes', 'label', 'label_original', 'label_binary', 'disruption_subtype',
 ]
 
 # ── Feature columns for ML training (excludes identifiers and targets) ───
@@ -323,4 +326,5 @@ ML_DROP_COLUMNS = [
     'cancelled', 'match_quality', 'weather_confidence',
     'label_source', 'match_score_minutes', 'match_anchor', 'match_confidence',
     'training_eligible', 'feature_quality_score',
+    'label_original', 'label_binary', 'disruption_subtype',
 ]
