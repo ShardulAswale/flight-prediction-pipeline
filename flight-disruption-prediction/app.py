@@ -78,6 +78,7 @@ pages = {
     "🤖 Model Performance": "Compare trained models, confusion matrices, ROC curves",
     "🔮 Predictions Explorer": "Interactive prediction tool with SHAP explanations",
     "🛡️ Data Quality": "Quality gates, missingness, drift alerts",
+    "Pipeline Runbook": "Clickable pipeline flow with commands, inputs, outputs, and artifact status",
 }
 
 cols = st.columns(3)

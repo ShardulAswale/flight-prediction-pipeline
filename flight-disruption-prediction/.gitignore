@@ -2,6 +2,7 @@
 outputs/
 important outputs/
 weighted_*_run/
+final_weighted_*_run/
 
 # Runtime / cache artifacts
 logs/

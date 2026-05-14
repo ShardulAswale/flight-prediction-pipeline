@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -166,6 +166,67 @@ def save_table_image(
     return path
 
 
+def _format_bar_value(value: float, context: str = "") -> str:
+    """Format compact labels for chart bars."""
+    if pd.isna(value):
+        return ""
+
+    value = float(value)
+    context_l = context.lower()
+    if "%" in context_l or "percent" in context_l or "pct" in context_l:
+        return f"{value:.1f}%"
+    if "size" in context_l and "mb" in context_l:
+        return _format_size(value)
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if abs(value) >= 10_000:
+        return f"{value:,.0f}"
+    if abs(value) >= 100:
+        return f"{value:,.0f}"
+    if 0 < abs(value) < 1:
+        return f"{value:.3f}"
+    if value.is_integer():
+        return f"{value:,.0f}"
+    return f"{value:.2f}"
+
+
+def _annotate_bar_values(
+    ax,
+    *,
+    horizontal: bool = False,
+    formatter: Callable[[float], str] | None = None,
+) -> None:
+    """Add readable numeric labels to matplotlib bar charts."""
+    formatter = formatter or (lambda value: _format_bar_value(value))
+    for patch in ax.patches:
+        if horizontal:
+            value = patch.get_width()
+            if pd.isna(value):
+                continue
+            ax.annotate(
+                formatter(float(value)),
+                xy=(value, patch.get_y() + patch.get_height() / 2),
+                xytext=(5, 0),
+                textcoords="offset points",
+                ha="left",
+                va="center",
+                fontsize=8,
+            )
+        else:
+            value = patch.get_height()
+            if pd.isna(value):
+                continue
+            ax.annotate(
+                formatter(float(value)),
+                xy=(patch.get_x() + patch.get_width() / 2, value),
+                xytext=(0, 5),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+
 def save_bar_chart(
     df: pd.DataFrame,
     x: str,
@@ -178,23 +239,32 @@ def save_bar_chart(
     ylabel: str | None = None,
     horizontal: bool = False,
     color: str = "#2D6A8E",
+    value_labels: bool = True,
+    value_formatter: Callable[[float], str] | None = None,
 ) -> Path:
     import matplotlib.pyplot as plt
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11, 6))
+    values = pd.to_numeric(df[y], errors="coerce")
     if horizontal:
-        ax.barh(df[x].astype(str), df[y], color=color)
+        ax.barh(df[x].astype(str), values, color=color)
         ax.set_xlabel(ylabel or y)
         ax.set_ylabel(xlabel or x)
+        ax.margins(x=0.18)
     else:
-        ax.bar(df[x].astype(str), df[y], color=color)
+        ax.bar(df[x].astype(str), values, color=color)
         ax.set_xlabel(xlabel or x)
         ax.set_ylabel(ylabel or y)
         ax.tick_params(axis="x", rotation=35)
+        ax.margins(y=0.15)
     ax.set_title(title, fontsize=15, weight="bold")
     ax.grid(axis="y" if not horizontal else "x", alpha=0.25)
+    if value_labels:
+        context = " ".join(part for part in [y, ylabel or ""] if part)
+        formatter = value_formatter or (lambda value: _format_bar_value(value, context))
+        _annotate_bar_values(ax, horizontal=horizontal, formatter=formatter)
     fig.tight_layout()
     path = out / f"{stem}.png"
     fig.savefig(path, dpi=160, bbox_inches="tight")
@@ -237,6 +307,39 @@ def save_dataset_size_charts(inventory: pd.DataFrame, out_dir: str | Path) -> di
         max_cols=5,
     )
 
+    processed_df = chart_df[~chart_df["dataset"].astype(str).eq("adsb_combined")].copy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(17, 6), gridspec_kw={"width_ratios": [1.1, 1]})
+    ax_all, ax_processed = axes
+    ax_all.bar(chart_df["dataset"].astype(str), chart_df["size_mb"], color="#3A7D44")
+    ax_all.set_yscale("log")
+    ax_all.set_xlabel("Dataset")
+    ax_all.set_ylabel("Size (MB, log scale)")
+    ax_all.set_title("All datasets, log scale", fontsize=13, weight="bold")
+    ax_all.tick_params(axis="x", rotation=35)
+    ax_all.grid(axis="y", alpha=0.25)
+    ax_all.margins(y=0.18)
+    _annotate_bar_values(ax_all, formatter=_format_size)
+
+    if processed_df.empty:
+        ax_processed.axis("off")
+        ax_processed.text(0.5, 0.5, "No processed datasets found", ha="center", va="center")
+    else:
+        ax_processed.bar(processed_df["dataset"].astype(str), processed_df["size_mb"], color="#2D6A8E")
+        ax_processed.set_xlabel("Dataset")
+        ax_processed.set_ylabel("Size (MB)")
+        ax_processed.set_title("Processed outputs, ADS-B excluded", fontsize=13, weight="bold")
+        ax_processed.tick_params(axis="x", rotation=35)
+        ax_processed.grid(axis="y", alpha=0.25)
+        ax_processed.margins(y=0.18)
+        _annotate_bar_values(ax_processed, formatter=_format_size)
+
+    fig.suptitle("Dataset Sizes: Full Scale and Processed Outputs", fontsize=16, weight="bold", y=1.04)
+    fig.tight_layout()
+    paths["combined"] = out / "dataset_sizes.png"
+    fig.savefig(paths["combined"], dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
     fig, ax = plt.subplots(figsize=(11, 6))
     ax.bar(chart_df["dataset"].astype(str), chart_df["size_mb"], color="#3A7D44")
     ax.set_yscale("log")
@@ -252,7 +355,6 @@ def save_dataset_size_charts(inventory: pd.DataFrame, out_dir: str | Path) -> di
     fig.savefig(paths["log"], dpi=160, bbox_inches="tight")
     plt.close(fig)
 
-    processed_df = chart_df[~chart_df["dataset"].astype(str).eq("adsb_combined")].copy()
     if not processed_df.empty:
         fig, ax = plt.subplots(figsize=(11, 6))
         ax.bar(processed_df["dataset"].astype(str), processed_df["size_mb"], color="#2D6A8E")
@@ -351,18 +453,6 @@ def save_dataset_inventory(paths: Mapping[str, str | Path], out_dir: str | Path)
     save_dataframe(inv, "dataset_inventory", out_dir)
     save_table_image(inv, "dataset_inventory", out_dir, title="Dataset Inventory")
     if inv["exists"].any():
-        chart_df = inv[inv["exists"]].copy()
-        chart_df["size_mb"] = pd.to_numeric(chart_df["size_mb"], errors="coerce").fillna(0)
-        save_bar_chart(
-            chart_df,
-            "dataset",
-            "size_mb",
-            "dataset_sizes",
-            out_dir,
-            title="Dataset Size by Source",
-            ylabel="Size (MB)",
-            color="#3A7D44",
-        )
         save_dataset_size_charts(inv, out_dir)
     return inv
 

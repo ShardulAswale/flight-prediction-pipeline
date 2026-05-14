@@ -1,9 +1,10 @@
-"""Predictions Explorer - existing-flight, manual, and batch probability predictions."""
+"""Predictions Explorer - stable inference UI for binary or multiclass models."""
 import json
 import os
 import sys
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -11,7 +12,7 @@ import streamlit as st
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.streamlit_utils import read_parquet_filtered
 
-st.set_page_config(page_title="Predictions Explorer", page_icon="??", layout="wide")
+st.set_page_config(page_title="Predictions Explorer", page_icon="P", layout="wide")
 st.markdown("# Predictions Explorer")
 
 try:
@@ -25,11 +26,18 @@ if not comparison_path.exists():
     st.warning("No trained models found. Run `python main.py --stage train` first.")
     st.stop()
 
-with open(comparison_path) as f:
+with open(comparison_path, encoding="utf-8") as f:
     comparison = json.load(f)
 
-best_model_name = comparison.get("best_model", "random_forest")
-model_path = Path(f"models/{best_model_name}.pkl")
+available_models = [item.get("model") for item in comparison.get("ranking", []) if item.get("model")]
+default_model_name = comparison.get("best_model", available_models[0] if available_models else "random_forest")
+selected_model_name = st.sidebar.selectbox(
+    "Prediction model",
+    available_models or [default_model_name],
+    index=(available_models.index(default_model_name) if default_model_name in available_models else 0),
+)
+
+model_path = Path(f"models/{selected_model_name}.pkl")
 feature_path = Path("models/feature_list.json")
 imputer_path = Path("models/imputer.pkl")
 scaler_path = Path("models/scaler.pkl")
@@ -49,22 +57,39 @@ def load_prediction_artifacts(model_file: str, imputer_file: str, scaler_file: s
     loaded_imputer = joblib.load(imputer_file)
     loaded_scaler = joblib.load(scaler_file)
     loaded_encoder = joblib.load(encoder_file)
-    with open(feature_file) as f:
+    with open(feature_file, encoding="utf-8") as f:
         loaded_features = json.load(f)
     return loaded_model, loaded_imputer, loaded_scaler, loaded_encoder, loaded_features
 
 
 @st.cache_resource(show_spinner=False)
-def load_shap_explainer(model_obj):
+def load_shap_explainer(_model_obj):
     import shap
 
-    return shap.TreeExplainer(model_obj)
+    return shap.TreeExplainer(_model_obj)
 
 
 @st.cache_data(show_spinner=False)
 def load_flight_index(path: str) -> pd.DataFrame:
-    columns = ["flight_key", "scheduled_dep", "origin", "destination", "label", "delay_minutes"]
-    return pd.read_parquet(path, columns=columns)
+    try:
+        import pyarrow.parquet as pq
+
+        parquet_cols = pq.ParquetFile(path).schema.names
+    except Exception:
+        parquet_cols = pd.read_parquet(path).columns.tolist()
+
+    columns = [
+        "flight_key",
+        "scheduled_dep",
+        "origin",
+        "destination",
+        "label",
+        "label_binary",
+        "disruption_subtype",
+        "delay_minutes",
+    ]
+    use_cols = [c for c in columns if c in parquet_cols]
+    return pd.read_parquet(path, columns=use_cols)
 
 
 model, imputer, scaler, label_encoder, feature_cols = load_prediction_artifacts(
@@ -75,24 +100,40 @@ model, imputer, scaler, label_encoder, feature_cols = load_prediction_artifacts(
     str(feature_path),
 )
 
+model_classes = [str(c) for c in label_encoder.classes_]
+is_binary_disruption_model = set(model_classes) == {"Disrupted", "Normal"}
+
 ml_path = Path("data/processed/ml_dataset.parquet")
 if not ml_path.exists():
     st.warning("Final dataset not found. Run the pipeline first.")
     st.stop()
 
-index_cols = ["flight_key", "scheduled_dep", "origin", "destination", "label", "delay_minutes"]
-
 df_index = load_flight_index(str(ml_path))
+label_filter_column = "label_binary" if is_binary_disruption_model and "label_binary" in df_index.columns else "label"
 
 st.caption(
-    f"Loaded `{best_model_name}` with {len(feature_cols)} features. "
-    "Probabilities are raw model probabilities, not calibrated probabilities."
+    f"Loaded `{selected_model_name}` with {len(feature_cols)} features. "
+    f"Target classes: {model_classes}. Probabilities are raw model probabilities, not calibrated probabilities."
 )
 st.info("Minimal mode is enabled for stability: selection, prediction, and probability table only.")
 
 
 def fetch_selected_row(index_row: pd.Series) -> pd.DataFrame:
-    full_columns = list(dict.fromkeys(index_cols + feature_cols))
+    full_columns = list(
+        dict.fromkeys(
+            [
+                "flight_key",
+                "scheduled_dep",
+                "origin",
+                "destination",
+                "label",
+                "label_binary",
+                "disruption_subtype",
+                "delay_minutes",
+                *feature_cols,
+            ]
+        )
+    )
     filters = {}
     if "flight_key" in index_row.index and pd.notna(index_row["flight_key"]):
         filters["flight_key"] = index_row["flight_key"]
@@ -130,15 +171,24 @@ def prediction_table(probs: np.ndarray) -> pd.DataFrame:
 
 def disruption_probability(probs: np.ndarray) -> float:
     class_to_prob = dict(zip(label_encoder.classes_, probs))
+    if "Disrupted" in class_to_prob:
+        return float(class_to_prob.get("Disrupted", 0.0))
     return float(class_to_prob.get("Late", 0.0) + class_to_prob.get("Cancelled", 0.0))
 
 
 def render_prediction(df_input: pd.DataFrame, title: str = "Predicted label"):
     X = preprocess_features(df_input)
-    pred = model.predict(X)
-    pred_idx = int(np.ravel(pred)[0])
-    label = label_encoder.inverse_transform([pred_idx])[0]
     probs = model.predict_proba(X)[0] if hasattr(model, "predict_proba") else None
+    if probs is not None:
+        pred_idx = int(np.argmax(probs))
+    else:
+        pred = model.predict(X)
+        pred_arr = np.asarray(pred)
+        if pred_arr.ndim > 1:
+            pred_idx = int(np.argmax(pred_arr[0]))
+        else:
+            pred_idx = int(np.ravel(pred_arr)[0])
+    label = label_encoder.inverse_transform([pred_idx])[0]
 
     st.success(f"{title}: **{label}**")
     if probs is not None:
@@ -174,84 +224,104 @@ def render_shap(X: pd.DataFrame, pred_index: int | None = None):
             pd.DataFrame({"feature": feature_cols, "shap_value": sv})
             .assign(abs_shap=lambda d: d["shap_value"].abs())
             .sort_values("abs_shap", ascending=False)
-            .head(20)
+            .head(15)
             .sort_values("abs_shap")
         )
-        shap_fig = px.bar(shap_df, x="shap_value", y="feature", orientation="h", title="Top Feature Contributions (SHAP)")
-        st.plotly_chart(shap_fig, width="stretch")
+        fig, ax = plt.subplots(figsize=(8, 6))
+        colors = np.where(shap_df["shap_value"] >= 0, "#d97706", "#2563eb")
+        ax.barh(shap_df["feature"], shap_df["shap_value"], color=colors)
+        ax.set_title("Top Feature Contributions (SHAP)")
+        ax.set_xlabel("SHAP value")
+        plt.tight_layout()
+        st.pyplot(fig, width="stretch")
+        st.dataframe(shap_df.sort_values("abs_shap", ascending=False), width="stretch", hide_index=True)
     except Exception as exc:
         st.info(f"SHAP explanation unavailable: {exc}")
 
 
 st.subheader("Select Existing Flight")
-show_shap = st.sidebar.checkbox("Show SHAP explanation", value=False)
+show_shap = st.sidebar.checkbox("Enable SHAP tools", value=False)
 
-flight_cols = [col for col in index_cols if col in df_index.columns]
 st.write(f"Available flights: **{len(df_index):,}**")
 
-filter_cols = st.columns(4)
-label_filter = "All"
-origin_filter = "All"
-dest_filter = "All"
-text_filter = ""
+if {"origin", "destination"}.issubset(df_index.columns):
+    route_df = (
+        df_index[["origin", "destination"]]
+        .dropna()
+        .astype(str)
+        .drop_duplicates()
+        .sort_values(["origin", "destination"])
+        .reset_index(drop=True)
+    )
+    route_df["route"] = route_df["origin"] + " -> " + route_df["destination"]
 
-if "label" in df_index.columns:
-    label_values = ["All"] + sorted(df_index["label"].dropna().astype(str).unique().tolist())
-    label_filter = filter_cols[0].selectbox("Label", label_values)
-if "origin" in df_index.columns:
-    origin_values = ["All"] + sorted(df_index["origin"].dropna().astype(str).unique().tolist())
-    origin_filter = filter_cols[1].selectbox("Origin", origin_values)
-if "destination" in df_index.columns:
-    dest_values = ["All"] + sorted(df_index["destination"].dropna().astype(str).unique().tolist())
-    dest_filter = filter_cols[2].selectbox("Destination", dest_values)
-text_filter = filter_cols[3].text_input("Search flight key", "")
+    selected_route = st.selectbox("Route", route_df["route"].tolist(), key="predictions_route_select")
+    selected_origin, selected_destination = selected_route.split(" -> ", 1)
 
-candidate_mask = pd.Series(True, index=df_index.index)
-if label_filter != "All" and "label" in df_index.columns:
-    candidate_mask &= df_index["label"].astype(str).eq(label_filter)
-if origin_filter != "All" and "origin" in df_index.columns:
-    candidate_mask &= df_index["origin"].astype(str).eq(origin_filter)
-if dest_filter != "All" and "destination" in df_index.columns:
-    candidate_mask &= df_index["destination"].astype(str).eq(dest_filter)
-if text_filter.strip() and "flight_key" in df_index.columns:
-    candidate_mask &= df_index["flight_key"].astype(str).str.contains(text_filter.strip(), case=False, na=False)
+    route_matches = df_index.loc[
+        df_index["origin"].astype(str).eq(selected_origin)
+        & df_index["destination"].astype(str).eq(selected_destination)
+    ].copy()
+    selector_key = f"predictions_flight_select_{selected_origin}_{selected_destination}"
+else:
+    st.info("Route columns are unavailable in the flight index. Showing flights without route filtering.")
+    route_matches = df_index.copy()
+    selector_key = "predictions_flight_select_all"
 
-candidate_idx = df_index.index[candidate_mask]
-if len(candidate_idx) == 0:
-    st.warning("No flights match the current filters.")
+sort_cols = [c for c in ["scheduled_dep", "flight_key"] if c in route_matches.columns]
+if sort_cols:
+    route_matches = route_matches.sort_values(sort_cols)
+route_matches = route_matches.head(1000)
+
+if route_matches.empty:
+    st.warning("No flights found for the selected route.")
     st.stop()
 
-max_options = 1000
-limited_idx = candidate_idx[:max_options]
-if len(candidate_idx) > max_options:
-    st.info(f"Showing first {max_options:,} of {len(candidate_idx):,} matching flights. Use filters to narrow further.")
+if len(route_matches) == 1000:
+    st.info("Showing first 1,000 flights for the selected route.")
 else:
-    st.info(f"Showing {len(candidate_idx):,} matching flights.")
+    st.info(f"Showing {len(route_matches):,} flights for the selected route.")
 
-flight_options = df_index.loc[limited_idx, flight_cols].copy()
-if "scheduled_dep" in flight_options.columns:
-    flight_options["scheduled_dep"] = pd.to_datetime(flight_options["scheduled_dep"], errors="coerce", utc=True).dt.strftime("%Y-%m-%d %H:%M")
-flight_options["_row_id"] = limited_idx
-flight_options["_display"] = (
-    flight_options[flight_cols]
-    .apply(lambda row: " | ".join("" if pd.isna(v) else str(v) for v in row.tolist()), axis=1)
+flight_display_cols = [c for c in ["flight_key", "scheduled_dep", label_filter_column, "disruption_subtype", "delay_minutes"] if c in route_matches.columns]
+route_matches["scheduled_dep_display"] = pd.to_datetime(
+    route_matches["scheduled_dep"], errors="coerce", utc=True
+).dt.strftime("%Y-%m-%d %H:%M")
+route_matches["_flight_option"] = route_matches.apply(
+    lambda row: " | ".join(
+        [
+            str(row.get("flight_key", "")),
+            str(row.get("scheduled_dep_display", "")),
+            *(str(row.get(col, "")) for col in flight_display_cols if col not in {"flight_key", "scheduled_dep"}),
+        ]
+    ),
+    axis=1,
 )
 
-selected_display = st.selectbox("Choose a flight", options=flight_options["_display"].tolist(), index=0)
-selected_idx = int(flight_options.loc[flight_options["_display"] == selected_display, "_row_id"].iloc[0])
+flight_option_map = dict(zip(route_matches["_flight_option"], route_matches.index))
+selected_display = st.selectbox(
+    "Flight",
+    options=list(flight_option_map.keys()),
+    index=0,
+    key=selector_key,
+)
+selected_idx = int(flight_option_map[selected_display])
 selected_index_row = df_index.loc[selected_idx]
 selected_row = fetch_selected_row(selected_index_row)
 
+selected_show_cols = [c for c in ["flight_key", "scheduled_dep", "origin", "destination", "label", "label_binary", "disruption_subtype", "delay_minutes"] if c in selected_row.columns]
 st.markdown("#### Selected Flight")
-st.dataframe(selected_row[flight_cols], width="stretch", hide_index=True)
+st.dataframe(selected_row[selected_show_cols], width="stretch", hide_index=True)
 
 if st.button("Predict Selected Flight", type="primary"):
     label, probs, X_selected, pred_idx = render_prediction(selected_row)
-    if "label" in selected_row.columns:
-        actual_label = str(selected_row["label"].iloc[0])
+    actual_target_col = "label_binary" if is_binary_disruption_model and "label_binary" in selected_row.columns else "label"
+    if actual_target_col in selected_row.columns:
+        actual_label = str(selected_row[actual_target_col].iloc[0])
         if actual_label == str(label):
-            st.info(f"Actual label: **{actual_label}**. Prediction matches the saved label.")
+            st.info(f"Actual target label: **{actual_label}**. Prediction matches the saved target.")
         else:
-            st.warning(f"Actual label: **{actual_label}**. Prediction differs from the saved label.")
-    if show_shap:
+            st.warning(f"Actual target label: **{actual_label}**. Prediction differs from the saved target.")
+    if "label" in selected_row.columns and "label_binary" in selected_row.columns:
+        st.caption(f"Original label: {selected_row['label'].iloc[0]} | Binary target: {selected_row['label_binary'].iloc[0]}")
+    if show_shap and st.button("Generate SHAP explanation for selected flight"):
         render_shap(X_selected, pred_idx)

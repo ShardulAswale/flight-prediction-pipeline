@@ -430,10 +430,25 @@ class ModelTrainer:
         pr_auc_weighted = np.nan
         if hasattr(model, 'predict_proba'):
             y_score = model.predict_proba(X_test)
-            y_bin = label_binarize(y_test, classes=range(len(labels)))
-            if y_bin.shape[1] == y_score.shape[1]:
-                pr_auc_macro = float(average_precision_score(y_bin, y_score, average='macro'))
-                pr_auc_weighted = float(average_precision_score(y_bin, y_score, average='weighted'))
+            if len(labels) == 2:
+                positive_label = 'Disrupted' if 'Disrupted' in labels else labels[-1]
+                positive_idx = int(np.where(labels == positive_label)[0][0])
+                score_idx = positive_idx
+                model_classes = getattr(model, 'classes_', None)
+                if model_classes is not None:
+                    model_classes = np.asarray(model_classes)
+                    matches = np.where(model_classes == positive_idx)[0]
+                    if matches.size:
+                        score_idx = int(matches[0])
+                y_true_binary = (np.asarray(y_test) == positive_idx).astype(int)
+                positive_scores = y_score[:, score_idx]
+                pr_auc_macro = float(average_precision_score(y_true_binary, positive_scores))
+                pr_auc_weighted = pr_auc_macro
+            else:
+                y_bin = label_binarize(y_test, classes=range(len(labels)))
+                if y_bin.shape[1] == y_score.shape[1]:
+                    pr_auc_macro = float(average_precision_score(y_bin, y_score, average='macro'))
+                    pr_auc_weighted = float(average_precision_score(y_bin, y_score, average='weighted'))
         
         # Per-class recall (important for minority class)
         per_class_recall = recall_score(y_test, y_pred, average=None, zero_division=0)
@@ -874,7 +889,7 @@ class ModelTrainer:
             logger.warning(f"Failed to generate grouped feature importance chart: {e}")
         
         # ── Visualisations ───────────────────────────────────────────────
-        labels = results[list(results.keys())[0]]['metrics'].get('labels', [])
+        labels = np.asarray(results[list(results.keys())[0]]['metrics'].get('labels', []))
         
         # 1. Confusion matrices
         for name, data in results.items():
@@ -892,32 +907,43 @@ class ModelTrainer:
             except Exception as e:
                 logger.warning(f"Failed to generate confusion matrix for {name}: {e}")
         
-        # 2. ROC curves (OvR)
+        # 2. ROC curves
         try:
             from sklearn.metrics import roc_curve, auc
             from sklearn.preprocessing import label_binarize
-            
-            y_bin = label_binarize(y_test, classes=range(len(labels)))
-            
+
             fig, ax = plt.subplots(figsize=(10, 8))
             colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12']
-            
+
+            if len(labels) == 2:
+                positive_label = 'Disrupted' if 'Disrupted' in labels else labels[-1]
+                positive_idx = int(np.where(labels == positive_label)[0][0])
+                y_true_binary = (np.asarray(y_test) == positive_idx).astype(int)
+            else:
+                positive_label = str(labels[0])
+                positive_idx = 0
+                y_bin = label_binarize(y_test, classes=range(len(labels)))
+
             for idx, (name, data) in enumerate(results.items()):
                 model = data['model']
                 if hasattr(model, 'predict_proba'):
                     y_score = model.predict_proba(X_test)
-                    
-                    # Macro-average ROC
-                    fpr_all, tpr_all = [], []
-                    for i in range(len(labels)):
-                        if y_bin.shape[1] > i:
-                            fpr, tpr, _ = roc_curve(y_bin[:, i], y_score[:, i])
-                            fpr_all.append(fpr)
-                            tpr_all.append(tpr)
-                    
-                    if fpr_all:
-                        # Use first class for simplicity in plot
-                        fpr, tpr, _ = roc_curve(y_bin[:, 0], y_score[:, 0])
+
+                    score_idx = positive_idx
+                    model_classes = getattr(model, 'classes_', None)
+                    if model_classes is not None:
+                        model_classes = np.asarray(model_classes)
+                        matches = np.where(model_classes == positive_idx)[0]
+                        if matches.size:
+                            score_idx = int(matches[0])
+
+                    if len(labels) == 2:
+                        fpr, tpr, _ = roc_curve(y_true_binary, y_score[:, score_idx])
+                        roc_auc = auc(fpr, tpr)
+                        ax.plot(fpr, tpr, color=colors[idx % len(colors)],
+                               label=f'{name} (AUC={roc_auc:.3f})')
+                    elif y_bin.shape[1] > positive_idx:
+                        fpr, tpr, _ = roc_curve(y_bin[:, positive_idx], y_score[:, score_idx])
                         roc_auc = auc(fpr, tpr)
                         ax.plot(fpr, tpr, color=colors[idx % len(colors)],
                                label=f'{name} (AUC={roc_auc:.3f})')
@@ -925,7 +951,7 @@ class ModelTrainer:
             ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
             ax.set_xlabel('False Positive Rate')
             ax.set_ylabel('True Positive Rate')
-            ax.set_title('ROC Curves (One-vs-Rest, Class 0)')
+            ax.set_title(f'ROC Curves (Positive class: {positive_label})')
             ax.legend(loc='lower right')
             plt.tight_layout()
             fig.savefig(self.outputs_dir / 'roc_curves.png', dpi=150)
