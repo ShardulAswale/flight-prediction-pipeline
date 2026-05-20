@@ -7,10 +7,11 @@ import pandas as pd
 import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.streamlit_utils import get_parquet_metadata, read_parquet_limited
+from src.streamlit_utils import get_parquet_metadata, read_parquet_limited, render_walkthrough_header
 
-st.set_page_config(page_title="Data Explorer", page_icon="??", layout="wide")
-st.markdown("# ?? Data Explorer")
+st.set_page_config(page_title="Dataset Construction", page_icon="Data", layout="wide")
+st.markdown("# Step 3. Dataset Construction")
+render_walkthrough_header("dataset")
 
 PATH_MAP = {
     "ADS-B Combined": Path("data/processed/adsb_combined.parquet"),

@@ -9,9 +9,11 @@ import plotly.express as px
 import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from src.streamlit_utils import render_walkthrough_header
 
-st.set_page_config(page_title="Data Quality", page_icon="🛡️", layout="wide")
-st.markdown("# 🛡️ Data Quality Dashboard")
+st.set_page_config(page_title="Quality and Limitations", page_icon="Quality", layout="wide")
+st.markdown("# Step 7. Quality and Limitations")
+render_walkthrough_header("quality")
 
 ml_path = Path("data/processed/ml_dataset.parquet")
 df = pd.read_parquet(ml_path) if ml_path.exists() else pd.DataFrame()

@@ -8,10 +8,11 @@ import plotly.express as px
 import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.streamlit_utils import get_parquet_metadata, read_parquet_limited
+from src.streamlit_utils import get_parquet_metadata, read_parquet_limited, render_walkthrough_header
 
-st.set_page_config(page_title="Trajectory Map", page_icon="???", layout="wide")
-st.markdown("# ??? Trajectory Map")
+st.set_page_config(page_title="ADS-B Trajectory Evidence", page_icon="Map", layout="wide")
+st.markdown("# Step 4. ADS-B Trajectory Evidence")
+render_walkthrough_header("trajectory")
 
 sketch_path = Path("data/processed/trajectory_sketches.parquet")
 full_traj_path = Path("data/processed/trajectories.parquet")
@@ -41,7 +42,7 @@ display_cols = [c for c in ["trajectory_id", "flight_key", "callsign", "icao24"]
 id_options["_display"] = id_options[display_cols].astype(str).agg(" | ".join, axis=1)
 selected_display = st.sidebar.selectbox("Trajectory", id_options["_display"].tolist())
 selected_id = id_options.loc[id_options["_display"] == selected_display, "trajectory_id"].iloc[0]
-show_speed = st.sidebar.checkbox("Show Speed Profile", value=True)
+show_profiles = st.sidebar.checkbox("Show Altitude and Speed Profiles", value=True)
 
 traj_data = preview[preview["trajectory_id"].astype(str) == str(selected_id)].copy().sort_values("timestamp")
 
@@ -77,7 +78,13 @@ try:
         folium.Marker(coords[0], tooltip="Start").add_to(fmap)
         folium.Marker(coords[-1], tooltip="End").add_to(fmap)
 
-    st_folium(fmap, width=1400, height=520)
+    st_folium(
+        fmap,
+        width=1400,
+        height=520,
+        key=f"trajectory_map_{selected_id}",
+        returned_objects=[],
+    )
 except Exception as exc:
     st.info(f"Map rendering unavailable ({exc}). Showing a geographic scatter plot instead.")
     fig_map = px.scatter_geo(traj_data, lat=lat_col, lon=lon_col, title=f"Trajectory {selected_id}")
@@ -96,22 +103,32 @@ if alt_col and traj_data[alt_col].notna().any():
 
 traj_data["point_idx"] = range(len(traj_data))
 
-if alt_col and traj_data[alt_col].notna().any():
-    alt_fig = px.line(
-        traj_data,
-        x="point_idx",
-        y=alt_col,
-        title=f"Altitude Profile - {selected_id}",
-        labels={"point_idx": "Point Index", alt_col: "Altitude"},
-    )
-    st.plotly_chart(alt_fig, width="stretch")
+if show_profiles:
+    st.subheader("Altitude and Speed Profiles")
+    profile_cols = st.columns(2)
 
-if show_speed and speed_col and traj_data[speed_col].notna().any():
-    speed_fig = px.line(
-        traj_data,
-        x="point_idx",
-        y=speed_col,
-        title=f"Speed Profile - {selected_id}",
-        labels={"point_idx": "Point Index", speed_col: "Speed"},
-    )
-    st.plotly_chart(speed_fig, width="stretch")
+    with profile_cols[0]:
+        if alt_col and traj_data[alt_col].notna().any():
+            alt_fig = px.line(
+                traj_data,
+                x="point_idx",
+                y=alt_col,
+                title=f"Altitude Profile - {selected_id}",
+                labels={"point_idx": "Point Index", alt_col: "Altitude"},
+            )
+            st.plotly_chart(alt_fig, width="stretch")
+        else:
+            st.info("Altitude data is unavailable for this trajectory.")
+
+    with profile_cols[1]:
+        if speed_col and traj_data[speed_col].notna().any():
+            speed_fig = px.line(
+                traj_data,
+                x="point_idx",
+                y=speed_col,
+                title=f"Speed Profile - {selected_id}",
+                labels={"point_idx": "Point Index", speed_col: "Speed"},
+            )
+            st.plotly_chart(speed_fig, width="stretch")
+        else:
+            st.info("Speed data is unavailable for this trajectory.")

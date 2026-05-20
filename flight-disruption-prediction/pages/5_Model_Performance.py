@@ -11,9 +11,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from src.streamlit_utils import render_walkthrough_header
 
-st.set_page_config(page_title="Model Performance", page_icon="🤖", layout="wide")
-st.markdown("# 🤖 Model Performance")
+st.set_page_config(page_title="Model Results", page_icon="Model", layout="wide")
+st.markdown("# Step 6. Model Results")
+render_walkthrough_header("models")
 
 report_path = Path("models/model_comparison.json")
 if not report_path.exists():

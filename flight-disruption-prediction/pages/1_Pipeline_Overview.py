@@ -9,10 +9,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.streamlit_utils import get_parquet_metadata, get_run_metadata, load_json
+from src.streamlit_utils import get_parquet_metadata, get_run_metadata, load_json, render_walkthrough_header
 
-st.set_page_config(page_title="Pipeline Overview", page_icon="??", layout="wide")
-st.markdown("# ?? Pipeline Overview")
+st.set_page_config(page_title="Data and Pipeline", page_icon="Flow", layout="wide")
+st.markdown("# Step 2. Data and Pipeline")
+render_walkthrough_header("pipeline")
 
 st.subheader("Stage Outputs")
 

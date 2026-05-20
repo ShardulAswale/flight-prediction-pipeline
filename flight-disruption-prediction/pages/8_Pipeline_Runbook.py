@@ -18,6 +18,24 @@ from src.streamlit_utils import get_parquet_metadata, load_json
 
 st.set_page_config(page_title="Pipeline Runbook", page_icon="Flow", layout="wide")
 
+SOURCE_LINKS = {
+    "OpenSky weekly ADS-B samples": (
+        "https://s3.opensky-network.org/data-samples/states/{date}/{hour:02d}/"
+        "states_{date}-{hour:02d}.avro.tar"
+    ),
+    "BTS On-Time Performance ZIPs": (
+        "https://transtats.bts.gov/PREZIP/"
+        "On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip"
+    ),
+    "Eurocontrol OPDI flight list": (
+        "https://www.eurocontrol.int/performance/data/download/OPDI/v002/flight_list/"
+        "flight_list_{YYYYMM}.parquet"
+    ),
+    "IEM ASOS/METAR request API": "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py",
+    "OpenSky states API fallback": "https://opensky-network.org/api/states/all",
+    "Open-Meteo historical archive for optional en-route weather": "https://archive-api.open-meteo.com/v1/archive",
+}
+
 
 @dataclass(frozen=True)
 class Stage:
@@ -53,7 +71,12 @@ STAGES: list[Stage] = [
         title="2. Download Sources",
         command="python scripts/run_master_ingestion.py --start-date 2022-01-01 --end-date 2022-06-30 --execute",
         purpose="Download and normalize the source datasets used by the pipeline.",
-        inputs=["OpenSky sample archive", "BTS On-Time Performance data", "METAR/IEM weather source"],
+        inputs=[
+            "OpenSky weekly ADS-B samples: https://s3.opensky-network.org/data-samples/states/{date}/{hour:02d}/states_{date}-{hour:02d}.avro.tar",
+            "BTS On-Time Performance ZIPs: https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip",
+            "Eurocontrol OPDI monthly flight list: https://www.eurocontrol.int/performance/data/download/OPDI/v002/flight_list/flight_list_{YYYYMM}.parquet",
+            "METAR weather is fetched separately from IEM ASOS: https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py",
+        ],
         outputs=[
             "data/processed/adsb_combined.parquet",
             "data/processed/bts_combined.parquet",
@@ -62,6 +85,8 @@ STAGES: list[Stage] = [
         notes=[
             "This is the heavy data acquisition stage.",
             "Eurocontrol data may exist locally, but the final supervised model uses BTS labels only.",
+            "OpenSky uses weekly public sample folders and hourly AVRO TAR archives.",
+            "BTS and Eurocontrol are naturally monthly files, so the local raw layout stays flat by month.",
         ],
         status_paths=[
             "data/processed/adsb_combined.parquet",
@@ -104,10 +129,15 @@ STAGES: list[Stage] = [
         title="5. Add METAR Weather",
         command="python main.py --stage weather --force",
         purpose="Add nearest airport METAR weather observations to the merged flight table.",
-        inputs=["data/processed/ml_dataset_merged.parquet", "data/raw/metar.parquet"],
+        inputs=[
+            "data/processed/ml_dataset_merged.parquet",
+            "data/raw/metar.parquet",
+            "IEM ASOS/METAR request API: https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py",
+        ],
         outputs=["data/processed/ml_dataset_weather.parquet", "logs/weather_coverage.json"],
         notes=[
             "Weather is merged by nearest airport and nearest timestamp within tolerance.",
+            "The fetch script requests METAR reports with report_type=3 and variables tmpf, dwpf, sknt, vsby, and p01i.",
             "Weather coverage is partial and should be reported as such.",
         ],
         status_paths=["data/processed/ml_dataset_weather.parquet"],
@@ -282,6 +312,10 @@ st.write(
     "Click a stage in the flow to see the exact command, what it does, and which artifacts it should produce."
 )
 
+with st.expander("Data source links used by the pipeline", expanded=True):
+    for name, url in SOURCE_LINKS.items():
+        st.markdown(f"- **{name}:** `{url}`")
+
 if "selected_stage" not in st.session_state:
     st.session_state.selected_stage = STAGES[0].key
 
@@ -299,4 +333,3 @@ st.divider()
 
 selected = next(stage for stage in STAGES if stage.key == st.session_state.selected_stage)
 show_stage(selected)
-
